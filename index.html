@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>HIDDEN</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght@0,9..144,300..900;1,9..144,300..900&family=Bricolage+Grotesque:opsz,wght@12..96,400..800&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="style.css">
+<link rel="icon" type="image/svg+xml" href="icon.svg">
+</head>
+<body>
+
+<div class="wrap">
+  <div class="topline">
+    <h1 class="masthead"><img class="masthead-icon" src="icon.svg" alt="">HIDDEN</h1>
+    <button class="profile-trigger" id="profileTrigger" aria-label="Open profile"></button>
+    <div class="deck">games where your opponent can't see your move</div>
+  </div>
+
+  <div class="layout">
+    <div class="main-col">
+      <nav class="tabs" id="tabs"><!-- injected by app.js --></nav>
+      <div class="provenance">STARKNET MAINNET <span class="sep">&middot;</span> STRK20 PRIVACY POOL <span class="sep">&middot;</span> NO NAMES, NO HISTORY</div>
+      <div class="stage" id="stage"><!-- injected by app.js --></div>
+    </div>
+    <aside class="side-col" id="sideProfile"><!-- injected by app.js --></aside>
+  </div>
+</div>
+
+<div class="overlay-backdrop" id="profileOverlay"><!-- injected by app.js --></div>
+
+<script src="app.js"></script>
+</body>
+</html>
