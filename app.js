@@ -1,15 +1,12 @@
-// HIDDEN — app.js
-// Chain calls are stubbed — see connectWallet/commitMove/resolvePot near
-// the bottom. Swap for real strk20InvokeTransaction calls once contracts
-// are deployed. (placeholder-calldata pattern: strk20-by-example.org/
-// starknet-wallet-api/private-defi)
-//
-// Timers use real wall-clock durations (a 24h join window really counts
-// down 24h if you leave the tab open), but since there's no backend yet,
-// the "opponent" on every round is simulated locally and acts within
-// seconds so the demo stays testable — see scheduleMockOpponent() below.
-// None of this survives a page reload; that needs the real contract or a
-// backend behind it, not this mock.
+import { connect } from "get-starknet";
+import { WalletAccountV6 } from "starknet";
+
+// chain calls are stubbed, see connectAccount/commitMove/resolvePot below
+// swap for real strk20 calls once contracts are deployed
+
+// join/move deadlines count down real time, but the opponent on every
+// round is simulated locally so the demo doesn't need real waiting
+// see scheduleMockOpponent()
 
 const ICON_SVGS = {
   rock: `<svg viewBox="0 0 24 24"><path fill="currentColor" d="M12 3 L18 7 L20 14 L15 20 L9 20 L4 14 L6 7 Z"/></svg>`,
@@ -63,9 +60,8 @@ const RANKS = [2,3,4,5,6,7,8,9,10,'J','Q','K','A'];
 function rankValue(r){ return typeof r==='number' ? r : {J:11,Q:12,K:13,A:14}[r]; }
 function drawCard(){ return RANKS[Math.floor(Math.random()*RANKS.length)]; }
 
-// generated handle, not "agent_xyz" — word list is demo-scale (a few
-// hundred combos), a real version needs a bigger list and/or longer
-// suffix to stay collision-resistant
+// branded anonymous handle instead of "agent_xyz"
+// word list is demo-scale, needs more entropy to stay collision-resistant for real
 const NAME_ADJ = ['Hidden','Silent','Shadow','Masked','Quiet','Cloaked','Unseen','Veiled','Ghost','Sealed','Faceless','Muted'];
 const NAME_NOUN = ['Cat','Fox','Wolf','Owl','Raven','Hawk','Lynx','Otter','Falcon','Panther','Crow','Viper'];
 function generateUsername(){
@@ -95,12 +91,11 @@ const JOIN_PRESETS = [
   {label:'6 hours', ms:6*60*60*1000},
   {label:'24 hours', ms:24*60*60*1000},
 ];
-// fixed once matched, not creator-configurable in v1 — only the join
-// window is (per spec). easy to expose as a setting later
+// only the join window is creator-configurable per spec, move window is fixed for now
 const MOVE_WINDOW_MS = 24*60*60*1000;
 
-// public board, seeded with a couple placeholder rows so it's not empty
-// in this mock — replace with real backend data before launch
+// seeded with placeholder rows so the board isn't empty in the demo
+// replace with real data before launch, never ship fake rows in production
 const CASES = {
   rps:      [ {slug:randomSlug(), stake:1}, {slug:randomSlug(), stake:0.5} ],
   pd:       [ {slug:randomSlug(), stake:1} ],
@@ -108,9 +103,8 @@ const CASES = {
   assassin: [ {slug:randomSlug(), stake:1} ],
 };
 
-// every case the current user has created or joined, kept for this
-// session and resumable via My Cases
-let MY_ROUNDS = {}; // slug -> round
+// every case the user's created or joined, keyed by slug, so my cases can resume it
+let MY_ROUNDS = {};
 
 function newRound({game, stake, role, joinMs}){
   const slug = randomSlug();
@@ -122,9 +116,9 @@ function newRound({game, stake, role, joinMs}){
     filledAt: role==='joiner' ? Date.now() : null,
     moveDeadline: role==='joiner' ? Date.now()+MOVE_WINDOW_MS : null,
     myMoved:false, oppMoved:false,
-    myMove:null, oppMove:null,               // simul
-    myCard:null, oppCard:null, pot:0, betLog:[], outcomeKind:null, // bluff
-    myRole:null, myPicks:[], oppPicks:[],     // assassin
+    myMove:null, oppMove:null,
+    myCard:null, oppCard:null, pot:0, betLog:[], outcomeKind:null,
+    myRole:null, myPicks:[], oppPicks:[],
     outcome:null, recorded:false,
   };
   MY_ROUNDS[slug] = round;
@@ -132,16 +126,15 @@ function newRound({game, stake, role, joinMs}){
 }
 
 function dealBluffCards(round){ round.myCard=drawCard(); round.oppCard=drawCard(); round.pot=round.stake*2; }
+
 function startAssassinRole(round){
-  // real version should derive role from the first bit of
-  // poseidon(commitmentA, commitmentB) — neither player controls both
-  // commitments, so neither can bias their own role. coin flip for now
-  // since there's no real commitment yet
+  // real version derives role from hash(commitmentA, commitmentB), neither
+  // player controls both so neither can bias their own role, mocked here
   round.myRole = Math.random()<0.5 ? 'assassin' : 'target';
 }
 
-// simulates the other side of a round acting on its own schedule, so My
-// Cases has something real to resume into even if you switch tabs
+// simulates the other player acting on their own schedule, so my cases
+// has something real to resume into even after switching tabs
 function scheduleMockOpponent(round){
   if(round.role==='creator'){
     const joinDelay = 2500 + Math.random()*4000;
@@ -157,8 +150,7 @@ function scheduleMockOpponent(round){
       touch(round.slug);
     }, joinDelay);
   } else {
-    // joiner: the creator may realistically have already moved while
-    // waiting for someone to join, so simulate that split
+    // creator may have already moved while waiting, simulate that split
     if(Math.random() < 0.4){ setOpponentMove(round); }
     else { maybeScheduleOpponentMove(round, 3000 + Math.random()*6000); }
   }
@@ -187,10 +179,9 @@ function setOpponentMove(round){
   if(round.myMoved) resolveRound(round);
 }
 
-// re-render if the round currently on screen just changed underneath us
+// re-render only if this round is the one currently on screen
 function touch(slug){ if(state.activeSlug===slug) render(); updateMyCasesBadge(); if(document.getElementById('myCasesOverlay').classList.contains('open')) openMyCases(); }
 
-// resolution logic shared across all four engines
 function resolveRound(round){
   if(round.recorded) return;
   const engine = GAMES[round.game].engine;
@@ -226,7 +217,7 @@ function resolveRound(round){
   recordResult(round.game, round.stake, label, delta);
 }
 
-// forfeit/timeout resolution for the move window
+// resolves a round when the move window runs out instead of both moving
 function resolveOnTimeout(round){
   if(round.recorded) return;
   if(round.myMoved && !round.oppMoved){
@@ -248,13 +239,13 @@ function resolveOnTimeout(round){
 
 function expireRound(round){
   round.stage = 'expired';
-  PROFILE.balance += round.stake; // refund
+  PROFILE.balance += round.stake;
   const list = CASES[round.game];
   const i = list.findIndex(c=>c.slug===round.slug);
   if(i>-1) list.splice(i,1);
 }
 
-// checks every round for expired join/move windows once a second
+// checks every round once a second for expired join/move windows
 setInterval(()=>{
   let needsRender = false;
   Object.values(MY_ROUNDS).forEach(round=>{
@@ -292,9 +283,11 @@ function updateMyCasesBadge(){
   if(n>0){ badge.style.display='flex'; badge.textContent = n; } else { badge.style.display='none'; }
 }
 
+let account = null;
+
 let state = {
   game:'rps',
-  view:'board',       // 'board' | 'lobby'  (used when activeSlug is null)
+  view:'board', // 'board' | 'lobby', only used when activeSlug is null
   activeSlug:null,
   draft:{ stake:1, joinMs:JOIN_PRESETS[1].ms, customOn:false, customVal:1, customUnit:'hours' },
 };
@@ -313,10 +306,92 @@ function goToCreate(){
 }
 function openRound(slug){ state.activeSlug = slug; state.game = MY_ROUNDS[slug].game; closeMyCases(); render(); }
 
-// in-memory only, resets on reload since there's no wallet/backend wired
-// up yet. real version should read/write against the connected wallet's
-// own history, never a server that could link identity to play history —
-// that'd defeat the point of shielding balances in the first place
+function detectWallets() {
+  const wallets = [];
+  if (window.starknet_argentX) wallets.push({ id: 'argentX', name: 'Ready X', provider: window.starknet_argentX });
+  if (window.starknet_braavos) wallets.push({ id: 'braavos', name: 'Braavos', provider: window.starknet_braavos });
+  if (window.starknet_xverse) wallets.push({ id: 'xverse', name: 'Xverse', provider: window.starknet_xverse });
+  if (wallets.length === 0 && window.starknet) wallets.push({ id: 'starknet', name: window.starknet.name || 'Starknet Wallet', provider: window.starknet });
+  return wallets;
+}
+
+// WalletAccountV6 reaches STRK20 through the standard wallet API feature. Some
+// injected wallets also expose the same request function at the top level, so
+// support both shapes without assuming either one.
+function walletApiRequest(provider) {
+  const walletApi = provider?.features?.['starknet:walletApi'];
+  if (walletApi && typeof walletApi.request === 'function') {
+    return walletApi.request.bind(walletApi);
+  }
+  if (provider && typeof provider.request === 'function') {
+    return provider.request.bind(provider);
+  }
+  return null;
+}
+
+function isNotRegisteredError(err) {
+  const code = err?.code ?? err?.error?.code;
+  const message = String(err?.message ?? err?.error?.message ?? err ?? '').toUpperCase();
+  return code === 'NOT_REGISTERED' || message.includes('NOT_REGISTERED') || message.includes('NOT REGISTERED');
+}
+
+async function supportsStrk20(provider) {
+  // A caller may already have a WalletAccountV6 rather than the injected
+  // wallet object. In that case starknet.js exposes the typed method directly.
+  if (typeof provider?.strk20Balances === 'function') {
+    try {
+      await provider.strk20Balances([]);
+      return true;
+    } catch (err) {
+      return isNotRegisteredError(err);
+    }
+  }
+
+  const request = walletApiRequest(provider);
+  if (!request) return false;
+
+  // This is a capability probe, not a balance check. An address that has
+  // never entered the pool is valid and returns NOT_REGISTERED.
+  try {
+    await request({ type: 'wallet_strk20Balances', params: { tokens: [] } });
+    return true;
+  } catch (err) {
+    return isNotRegisteredError(err);
+  }
+}
+
+// talks straight to the injected wallet object
+async function connectAccount(){
+  const wallets = detectWallets();
+  if(wallets.length === 0){
+    alert('no starknet wallet found, install Ready X or Xverse');
+    return null;
+  }
+
+  // more than one installed, just take the first for now, a proper
+  // picker is a nice-to-have once this is confirmed working
+  const provider = wallets[0].provider;
+
+  try {
+    const accounts = await provider.request({ type: 'wallet_requestAccounts' });
+    const address = Array.isArray(accounts) ? accounts[0] : accounts;
+    if(!address) return null;
+
+    if(!(await supportsStrk20(provider))){
+      alert("this wallet doesn't support STRK20 private actions yet, try Ready X or Xverse");
+      return null;
+    }
+
+    return { address, provider };
+  } catch (err) {
+    console.error(err);
+    alert('could not connect, make sure your wallet is unlocked and try again');
+    return null;
+  }
+}
+
+// visible only to this user, saved to localStorage keyed by wallet address
+// so it comes back on reconnect but never leaves the device
 let PROFILE = {
   username: generateUsername(),
   balance: 12.4,
@@ -325,6 +400,17 @@ let PROFILE = {
   currentStreak:0, bestStreak:0,
   gameCounts:{ rps:0, pd:0, bluff:0, assassin:0 },
 };
+
+function saveProfile(){
+  if(!account) return;
+  localStorage.setItem(`hidden_profile_${account.address}`, JSON.stringify(PROFILE));
+}
+
+function loadProfile(){
+  const raw = localStorage.getItem(`hidden_profile_${account.address}`);
+  if(raw){ PROFILE = JSON.parse(raw); return; }
+  PROFILE.username = generateUsername(); // first time this wallet's connected here
+}
 
 function profileTitle(){
   if(PROFILE.gamesPlayed < 3) return 'Newcomer';
@@ -346,11 +432,29 @@ function recordResult(gameKey, stake, label, deltaStrk){
   else if(label==='lose'){ PROFILE.losses++; PROFILE.currentStreak = PROFILE.currentStreak<0?PROFILE.currentStreak-1:-1; }
   else { PROFILE.ties++; PROFILE.currentStreak = 0; }
   if(Math.abs(PROFILE.currentStreak) > Math.abs(PROFILE.bestStreak)) PROFILE.bestStreak = PROFILE.currentStreak;
+
+  saveProfile();
 }
 
 function renderSideProfile(){
   const el = document.getElementById('sideProfile');
   if(!el) return;
+
+  if(!account){
+    el.innerHTML = `
+      <div class="profile-card torn">
+        <div class="panel-hint">connect your wallet to see your profile</div>
+        <button class="btn3 wide" id="sideConnectBtn" style="margin-top:12px;">Connect wallet</button>
+      </div>
+    `;
+    document.getElementById('sideConnectBtn').onclick = async ()=>{
+      account = await connectAccount();
+      if(account) loadProfile();
+      render();
+    };
+    return;
+  }
+
   const winRate = PROFILE.gamesPlayed ? Math.round((PROFILE.wins/PROFILE.gamesPlayed)*100) : 0;
   el.innerHTML = `
     <div class="profile-card torn" id="sideProfileCard">
@@ -373,6 +477,25 @@ function renderSideProfile(){
 
 function openProfile(){
   const overlay = document.getElementById('profileOverlay');
+
+  if(!account){
+    overlay.innerHTML = `
+      <div class="panel torn profile-full">
+        <button class="close-x" id="closeProfileBtn">CLOSE &times;</button>
+        <div class="panel-hint">connect your wallet to see your profile</div>
+        <button class="btn3 wide" id="fullConnectBtn" style="margin-top:12px;">Connect wallet</button>
+      </div>
+    `;
+    document.getElementById('closeProfileBtn').onclick = closeProfile;
+    document.getElementById('fullConnectBtn').onclick = async ()=>{
+      account = await connectAccount();
+      if(account) loadProfile();
+      openProfile();
+    };
+    overlay.classList.add('open');
+    return;
+  }
+
   const winRate = PROFILE.gamesPlayed ? Math.round((PROFILE.wins/PROFILE.gamesPlayed)*100) : 0;
   const favEntry = Object.entries(PROFILE.gameCounts).sort((a,b)=>b[1]-a[1])[0];
   const favName = favEntry && favEntry[1]>0 ? GAMES[favEntry[0]].name : '\u2014';
@@ -508,7 +631,14 @@ function renderBoard(el){
   document.getElementById('createCard').onclick = goToCreate;
 }
 
-function joinBoardCase(index){
+// joining stakes into a case too, so it needs a wallet the same as creating one
+async function joinBoardCase(index){
+  if(!account){
+    account = await connectAccount();
+    if(!account) return;
+    loadProfile();
+  }
+
   const list = CASES[state.game];
   const c = list[index];
   if(!c) return;
@@ -521,6 +651,21 @@ function joinBoardCase(index){
 }
 
 function renderLobby(el){
+  if(!account){
+    el.innerHTML = `
+      <div class="panel torn enter">
+        <div class="panel-hint">connect your wallet first to post a case</div>
+        <button class="btn3 wide" id="lobbyConnectBtn" style="margin-top:12px;">Connect wallet</button>
+      </div>
+    `;
+    document.getElementById('lobbyConnectBtn').onclick = async ()=>{
+      account = await connectAccount();
+      if(account) loadProfile();
+      render();
+    };
+    return;
+  }
+
   const d = state.draft;
   el.innerHTML = `
     <div class="panel torn enter">
@@ -548,7 +693,7 @@ function renderLobby(el){
         </div>
       ` : ''}
 
-      <button class="btn3 wide" id="createBtn" style="margin-top:20px;">Connect wallet &amp; post case</button>
+      <button class="btn3 wide" id="createBtn" style="margin-top:20px;">Post case</button>
       <div class="panel-hint">Stake shields on deposit \u2014 the pool sees an amount arrive, not which wallet sent it. If nobody joins before your timer runs out, you're refunded automatically.</div>
     </div>
   `;
@@ -562,10 +707,9 @@ function renderLobby(el){
     document.getElementById('customVal').oninput = (e)=>{ d.customVal = parseFloat(e.target.value)||1; };
     document.getElementById('customUnit').onchange = (e)=>{ d.customUnit = e.target.value; };
   }
-  document.getElementById('createBtn').onclick = connectWallet;
+  document.getElementById('createBtn').onclick = createCaseNow;
 }
 
-// dispatches on round.stage
 function renderRound(el, round){
   if(round.stage==='share'){ renderSharePanel(el, round); return; }
   if(round.stage==='waiting'){ renderWaitingPanel(el, round); return; }
@@ -670,7 +814,6 @@ function renderMatchedPanel(el, round){
   document.getElementById('laterBtn').onclick = ()=> goToBoard();
 }
 
-// RPS + Prisoner's Dilemma
 function renderSimulPlay(el, round){
   const cfg = SIMUL_CONFIG[round.game];
 
@@ -732,7 +875,7 @@ function renderBluffPlay(el, round){
       round.myMoved = true;
       round.stage='pending-call'; render();
       // opponent's call/fold response, kept as a short simulated exchange
-      // rather than its own async window
+      // instead of its own async window, see design note in the readme
       setTimeout(()=>{
         const oppStrength = rankValue(round.oppCard || (round.oppCard=drawCard()));
         const callChance = 0.35 + (oppStrength/14)*0.5;
@@ -896,11 +1039,11 @@ function renderAssassinResult(el, round){
   };
 }
 
-// stubbed chain calls, wire these up to real STRK20 SDK calls once contracts are deployed
-function connectWallet(){
+function createCaseNow(){
   const btn = document.getElementById('createBtn');
-  btn.textContent = 'Connecting...'; btn.disabled = true;
-  setTimeout(()=>{
+  btn.textContent = 'Posting...';
+  btn.disabled = true;
+  setTimeout(()=>{ // stubbed, swap for the real stake call once the contract's deployed
     const d = state.draft;
     const joinMs = d.customOn ? d.customVal*(d.customUnit==='hours'?3600000:60000) : d.joinMs;
     const round = newRound({ game: state.game, stake: d.stake, role:'creator', joinMs });
@@ -912,16 +1055,16 @@ function connectWallet(){
 function commitMove(done){
   const btn = document.getElementById('lockBtn');
   if(btn){ btn.textContent='Submitting commitment...'; btn.disabled=true; }
-  setTimeout(done, 700);
+  setTimeout(done, 700); // stubbed, swap for the real reveal-adjacent call later
 }
 function resolvePot(done){
   const btn = document.getElementById('claimBtn');
   if(btn){ btn.textContent='Claiming into shielded balance...'; btn.disabled=true; }
-  setTimeout(done, 700);
+  setTimeout(done, 700); // stubbed, swap for the real claim call once the contract's deployed
 }
 
-document.getElementById('profileTrigger').onclick = openProfile;
 document.getElementById('myCasesTrigger').onclick = openMyCases;
+document.getElementById('profileTrigger').onclick = openProfile;
 document.getElementById('profileOverlay').addEventListener('click', (e)=>{ if(e.target.id==='profileOverlay') closeProfile(); });
 document.getElementById('myCasesOverlay').addEventListener('click', (e)=>{ if(e.target.id==='myCasesOverlay') closeMyCases(); });
 document.addEventListener('keydown', (e)=>{ if(e.key==='Escape'){ closeProfile(); closeMyCases(); } });
