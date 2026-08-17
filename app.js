@@ -92,7 +92,7 @@ const JOIN_PRESETS = [
   {label:'24 hours', ms:24*60*60*1000},
 ];
 // only the join window is creator-configurable per spec, move window is fixed for now
-const MOVE_WINDOW_MS = 24*60*60*1000;
+const MOVE_WINDOW_MS = 4*60*60*1000;
 
 // seeded with placeholder rows so the board isn't empty in the demo
 // replace with real data before launch, never ship fake rows in production
