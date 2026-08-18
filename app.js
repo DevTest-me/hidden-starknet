@@ -67,7 +67,7 @@ function generateUsername(){
 
 const SLUG_CHARS = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
 function randomSlug(len=11){ let s=''; for(let i=0;i<len;i++) s+=SLUG_CHARS[Math.floor(Math.random()*SLUG_CHARS.length)]; return s; }
-function caseLink(caseId){ return `hidden.app/c/${caseId}`; }
+function caseLink(caseId){ return `${window.location.origin}/?case=${caseId}`; }
 
 function formatCountdown(ms){
   if(ms<=0) return 'expired';
@@ -88,7 +88,7 @@ const JOIN_PRESETS = [
 const MOVE_WINDOW_MS = 4*60*60*1000;
 const CONTRACT_ADDRESS = '0x028ac1fac46e7334fe1bf40bb4011072366e52c8553d4b87c059faa5de3daf92';
 const SEPOLIA_STRK_ADDRESS = '0x04718f5a0fc34cc1af16a1cdee98ffb20c31f5cd61d6ab07201858f4287c938d';
-const SEPOLIA_RPC_URL = 'https://api.zan.top/public/starknet-sepolia/rpc/';
+const SEPOLIA_RPC_URL = `https://starknet-sepolia.g.alchemy.com/starknet/version/rpc/v0_8/${import.meta.env.VITE_ALCHEMY_KEY}`;
 
 // ---------------------------------------------------------------
 // Chain wiring
@@ -114,10 +114,10 @@ function randomFelt(){
 }
 
 function computeMoveHash(moveValue, salt){
-  return hash.poseidonHashMany([MOVE_TAG_FELT, BigInt(moveValue), salt]);
+  return hash.computePoseidonHashOnElements([MOVE_TAG_FELT, BigInt(moveValue), salt]);
 }
 function computeClaimHash(secret){
-  return hash.poseidonHashMany([CLAIM_TAG_FELT, secret]);
+  return hash.computePoseidonHashOnElements([CLAIM_TAG_FELT, secret]);
 }
 
 function toStakeFelt(stakeDecimal){
@@ -568,7 +568,10 @@ async function connectAccount(){
   const provider = wallets[0].provider;
   log('connectAccount: using', wallets[0].name);
   try {
-    const accounts = await provider.request({ type: 'wallet_requestAccounts' });
+    const accounts = await Promise.race([
+      provider.request({ type: 'wallet_requestAccounts' }),
+      new Promise((_, reject) => setTimeout(() => reject(new Error('wallet did not respond within 15s, its approval popup may not have opened')), 15000)),
+    ]);
     log('connectAccount: accounts', accounts);
     const address = Array.isArray(accounts) ? accounts[0] : accounts;
     if(!address) return null;
@@ -576,8 +579,9 @@ async function connectAccount(){
     const supported = await supportsStrk20(provider);
     log('connectAccount: supportsStrk20 result', supported);
     if(!supported){
-      alert("this wallet doesn't support STRK20 private actions yet, try Ready X or Xverse. Check the console for details on why the check failed.");
-      return null;
+     // not blocking on this yet, staking isn't wired up regardless of what
+     // this check says. revisit once privacy_invoke is actually used
+     log('connectAccount: STRK20 check failed, proceeding anyway since staking is stubbed');
     }
 
     let publicBalance = null;
@@ -896,6 +900,7 @@ function renderLobby(el){
         <input type="number" id="stakeInput" min="0.01" step="0.01" value="${d.stake}">
         <span class="unit">STRK</span>
       </div>
+      <div id="stakeWarning" class="panel-hint" style="display:none; color:var(--stamp);">this is more than your current balance</div>
 
       <div class="section-label">How long should this stay open for someone to join?</div>
       <div class="chip-row" id="joinChips">
@@ -917,7 +922,11 @@ function renderLobby(el){
     </div>
   `;
   document.getElementById('backBtn').onclick = ()=> goToBoard();
-  document.getElementById('stakeInput').oninput = (e)=>{ d.stake = parseFloat(e.target.value)||0; };
+  document.getElementById('stakeInput').oninput = (e)=>{
+  d.stake = parseFloat(e.target.value)||0;
+  const warn = document.getElementById('stakeWarning');
+  if(warn) warn.style.display = (account?.publicBalance != null && d.stake > account.publicBalance) ? 'block' : 'none';
+  };
   el.querySelectorAll('#joinChips .chip[data-ms]').forEach(c=>{
     c.onclick = ()=>{ d.customOn=false; d.joinMs=parseInt(c.dataset.ms,10); render(); };
   });
@@ -1332,5 +1341,12 @@ document.getElementById('profileOverlay').addEventListener('click', (e)=>{ if(e.
 document.getElementById('myCasesOverlay').addEventListener('click', (e)=>{ if(e.target.id==='myCasesOverlay') closeMyCases(); });
 document.addEventListener('keydown', (e)=>{ if(e.key==='Escape'){ closeProfile(); closeMyCases(); } });
 
+function checkUrlForCase(){
+  const params = new URLSearchParams(window.location.search);
+  const caseId = params.get('case');
+  if(caseId) joinCaseById(caseId);
+}
+
 log('HIDDEN app loaded, contract:', CONTRACT_ADDRESS);
 render();
+checkUrlForCase();
