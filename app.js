@@ -1,12 +1,16 @@
 import { connect } from "get-starknet";
-import { WalletAccountV6 } from "starknet";
+import { WalletAccountV6, RpcProvider, hash, shortString } from "starknet";
 
-// chain calls are stubbed, see connectAccount/commitMove/resolvePot below
-// swap for real strk20 calls once contracts are deployed
-
-// join/move deadlines count down real time, but the opponent on every
-// round is simulated locally so the demo doesn't need real waiting
-// see scheduleMockOpponent()
+// Main workflow (create/join/commit/reveal/resolve) is wired to the real
+// deployed Sepolia contract. privacy_invoke (Deposit/Claim) is still a
+// stub, that needs the live STRK20 pool. See the MAINNET POOL comments.
+//
+// DEBUG=true logs every chain interaction to the console with a
+// [HIDDEN] prefix, open devtools before testing anything. Flip to
+// false once things are working reliably and the noise isn't needed.
+const DEBUG = true;
+function log(...args){ if(DEBUG) console.log('[HIDDEN]', ...args); }
+function logError(...args){ if(DEBUG) console.error('[HIDDEN]', ...args); }
 
 const ICON_SVGS = {
   rock: `<svg viewBox="0 0 24 24"><path fill="currentColor" d="M12 3 L18 7 L20 14 L15 20 L9 20 L4 14 L6 7 Z"/></svg>`,
@@ -36,8 +40,6 @@ const SIMUL_CONFIG = {
     cols:3,
     chooseCopy:'Choose \u2014 this gets hashed with a random salt before it ever touches the chain.',
     lockCopy:'Locking submits only a commitment hash. Nobody \u2014 not your opponent, not the pool \u2014 can see the move underneath until reveal.',
-    resolve(my,opp){ if(my===opp) return 'tie'; const beats={rock:'scissors',paper:'rock',scissors:'paper'}; return beats[my]===opp?'win':'lose'; },
-    resultCopy(outcome,my,opp){ const l=id=>SIMUL_CONFIG.rps.options.find(o=>o.id===id).label; return `${l(my)} vs ${l(opp)}`; },
   },
   pd: {
     options: [
@@ -47,12 +49,6 @@ const SIMUL_CONFIG = {
     cols:2,
     chooseCopy:'Neither of you will know the other\u2019s choice until both are committed.',
     lockCopy:'Your choice is sealed as a commitment hash. Trust is a bet on someone you cannot currently see.',
-    resolve(my,opp){ if(my===opp) return 'tie'; return my==='betray'?'win':'lose'; },
-    resultCopy(outcome,my,opp){
-      if(my===opp && my==='trust') return 'Both parties trusted. Stakes returned in full.';
-      if(my===opp && my==='betray') return 'Both parties betrayed. Pot split \u2014 nobody got the edge.';
-      return outcome==='win' ? 'You betrayed a trusting opponent.' : 'You trusted, and were betrayed.';
-    },
   },
 };
 
@@ -60,8 +56,6 @@ const RANKS = [2,3,4,5,6,7,8,9,10,'J','Q','K','A'];
 function rankValue(r){ return typeof r==='number' ? r : {J:11,Q:12,K:13,A:14}[r]; }
 function drawCard(){ return RANKS[Math.floor(Math.random()*RANKS.length)]; }
 
-// branded anonymous handle instead of "agent_xyz"
-// word list is demo-scale, needs more entropy to stay collision-resistant for real
 const NAME_ADJ = ['Hidden','Silent','Shadow','Masked','Quiet','Cloaked','Unseen','Veiled','Ghost','Sealed','Faceless','Muted'];
 const NAME_NOUN = ['Cat','Fox','Wolf','Owl','Raven','Hawk','Lynx','Otter','Falcon','Panther','Crow','Viper'];
 function generateUsername(){
@@ -73,7 +67,7 @@ function generateUsername(){
 
 const SLUG_CHARS = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
 function randomSlug(len=11){ let s=''; for(let i=0;i<len;i++) s+=SLUG_CHARS[Math.floor(Math.random()*SLUG_CHARS.length)]; return s; }
-function caseLink(slug){ return `hidden.app/c/${slug}`; }
+function caseLink(caseId){ return `hidden.app/c/${caseId}`; }
 
 function formatCountdown(ms){
   if(ms<=0) return 'expired';
@@ -91,133 +85,344 @@ const JOIN_PRESETS = [
   {label:'6 hours', ms:6*60*60*1000},
   {label:'24 hours', ms:24*60*60*1000},
 ];
-// only the join window is creator-configurable per spec, move window is fixed for now
 const MOVE_WINDOW_MS = 4*60*60*1000;
+const CONTRACT_ADDRESS = '0x028ac1fac46e7334fe1bf40bb4011072366e52c8553d4b87c059faa5de3daf92';
+const SEPOLIA_STRK_ADDRESS = '0x04718f5a0fc34cc1af16a1cdee98ffb20c31f5cd61d6ab07201858f4287c938d';
+const SEPOLIA_RPC_URL = 'https://api.zan.top/public/starknet-sepolia/rpc/';
 
-// seeded with placeholder rows so the board isn't empty in the demo
-// replace with real data before launch, never ship fake rows in production
-const CASES = {
-  rps:      [ {slug:randomSlug(), stake:1}, {slug:randomSlug(), stake:0.5} ],
-  pd:       [ {slug:randomSlug(), stake:1} ],
-  bluff:    [ {slug:randomSlug(), stake:5}, {slug:randomSlug(), stake:1} ],
-  assassin: [ {slug:randomSlug(), stake:1} ],
-};
+// ---------------------------------------------------------------
+// Chain wiring
+// ---------------------------------------------------------------
 
-// every case the user's created or joined, keyed by slug, so my cases can resume it
+const sepoliaRpc = new RpcProvider({ nodeUrl: SEPOLIA_RPC_URL });
+const GAME_TYPE_INDEX = { rps:0, pd:1, bluff:2, assassin:3 };
+const STRK_DECIMALS_FACTOR = 10n ** 18n;
+
+const MOVE_TAG_FELT = shortString.encodeShortString('HIDDEN_MOVE_TAG:V1');
+const CLAIM_TAG_FELT = shortString.encodeShortString('HIDDEN_CLAIM_TAG:V1');
+const CASE_CREATED_SELECTOR = hash.getSelectorFromName('CaseCreated');
+
+function packTiles(t1, t2, t3){ return BigInt(t1) + BigInt(t2)*16n + BigInt(t3)*256n; }
+function packBluffAction(action, cardIndex){ return BigInt(action) + BigInt(cardIndex)*2n; }
+
+function randomFelt(){
+  const bytes = new Uint8Array(31);
+  crypto.getRandomValues(bytes);
+  let hexStr = '0x';
+  for(const b of bytes) hexStr += b.toString(16).padStart(2,'0');
+  return BigInt(hexStr);
+}
+
+function computeMoveHash(moveValue, salt){
+  return hash.poseidonHashMany([MOVE_TAG_FELT, BigInt(moveValue), salt]);
+}
+function computeClaimHash(secret){
+  return hash.poseidonHashMany([CLAIM_TAG_FELT, secret]);
+}
+
+function toStakeFelt(stakeDecimal){
+  const micro = BigInt(Math.round(stakeDecimal * 1e6));
+  return micro * (STRK_DECIMALS_FACTOR / 1000000n);
+}
+
+function feltToBigInt(v){ return typeof v === 'bigint' ? v : BigInt(v); }
+function feltToBool(v){ return feltToBigInt(v) !== 0n; }
+
+async function sendInvoke(provider, calls){
+  const request = walletApiRequest(provider);
+  if(!request) throw new Error('wallet provider cannot send transactions');
+  log('sendInvoke: sending', calls);
+  const result = await request({ type:'wallet_addInvokeTransaction', params:{ calls } });
+  log('sendInvoke: wallet responded', result);
+  const txHash = result?.transaction_hash ?? result?.transactionHash ?? result;
+  if(!txHash) throw new Error('wallet did not return a transaction hash, see console for the raw response');
+  return txHash;
+}
+
+async function waitForReceipt(txHash){
+  log('waitForReceipt: waiting on', txHash);
+  for(let i=0;i<40;i++){
+    try {
+      const receipt = await sepoliaRpc.getTransactionReceipt(txHash);
+      if(receipt){ log('waitForReceipt: confirmed', receipt); return receipt; }
+    } catch(err) { /* not indexed yet, keep polling */ }
+    await new Promise(r=>setTimeout(r, 3000));
+  }
+  throw new Error('timed out waiting for the transaction to confirm');
+}
+
+async function readCase(caseId){
+  const raw = await sepoliaRpc.callContract({
+    contractAddress: CONTRACT_ADDRESS,
+    entrypoint: 'get_case',
+    calldata: [String(caseId)],
+  });
+  const f = raw.map(feltToBigInt);
+  let i = 0;
+  const next = () => f[i++];
+  const entry = {
+    creator: next(), opponent: next(), gameType: Number(next()), token: next(),
+    stakeAmount: next(), joinDeadline: Number(next()), moveDeadline: Number(next()),
+    commitHashA: next(), commitHashB: next(), revealedMoveA: next(), revealedMoveB: next(),
+    hasCommittedA: feltToBool(next()), hasCommittedB: feltToBool(next()),
+    hasRevealedA: feltToBool(next()), hasRevealedB: feltToBool(next()),
+    claimHashA: next(), claimHashB: next(),
+    fundedA: feltToBool(next()), fundedB: feltToBool(next()),
+    outcome: Number(next()), claimedA: feltToBool(next()), claimedB: feltToBool(next()),
+    assassinIsA: feltToBool(next()),
+  };
+  log('readCase', caseId, entry);
+  return entry;
+}
+
+async function submitCreateCase({ provider, gameKey, stakeDecimal, joinWindowSecs }){
+  const calldata = [
+    String(GAME_TYPE_INDEX[gameKey]),
+    SEPOLIA_STRK_ADDRESS,
+    toStakeFelt(stakeDecimal).toString(),
+    String(joinWindowSecs),
+  ];
+  log('submitCreateCase: calldata', calldata);
+  const txHash = await sendInvoke(provider, [{ contract_address: CONTRACT_ADDRESS, entry_point: 'create_case', calldata }]);
+  const receipt = await waitForReceipt(txHash);
+  const events = receipt.events || receipt.value?.events || [];
+  log('submitCreateCase: receipt events', events);
+  const created = events.find(e => (e.keys||[])[0] === CASE_CREATED_SELECTOR);
+  if(!created) throw new Error('create_case confirmed but no CaseCreated event was found, check the contract address and see console for the receipt');
+  const caseId = feltToBigInt(created.keys[1]);
+  log('submitCreateCase: new case id', caseId);
+  return { caseId, txHash };
+  // MAINNET POOL: bundle privacy_invoke(Deposit, ...) in the same
+  // multicall here once the pool is live. funded_a stays false without it.
+}
+
+async function submitJoinCase({ provider, caseId }){
+  const txHash = await sendInvoke(provider, [{ contract_address: CONTRACT_ADDRESS, entry_point: 'join_case', calldata: [String(caseId)] }]);
+  await waitForReceipt(txHash);
+  return txHash;
+  // MAINNET POOL: bundle the opponent's Deposit here too, once live.
+}
+
+async function submitCommitMove({ provider, caseId, moveValue, salt, claimSecret }){
+  const commitHash = computeMoveHash(moveValue, salt);
+  const claimHash = computeClaimHash(claimSecret);
+  log('submitCommitMove', { caseId, moveValue, commitHash, claimHash });
+  const txHash = await sendInvoke(provider, [{
+    contract_address: CONTRACT_ADDRESS, entry_point: 'commit_move',
+    calldata: [String(caseId), commitHash.toString(), claimHash.toString()],
+  }]);
+  await waitForReceipt(txHash);
+  return { txHash, commitHash, claimHash };
+}
+
+async function submitRevealMove({ provider, caseId, moveValue, salt }){
+  log('submitRevealMove', { caseId, moveValue });
+  const txHash = await sendInvoke(provider, [{
+    contract_address: CONTRACT_ADDRESS, entry_point: 'reveal_move',
+    calldata: [String(caseId), String(moveValue), salt.toString()],
+  }]);
+  await waitForReceipt(txHash);
+  return txHash;
+}
+
+async function submitResolve({ provider, caseId }){
+  log('submitResolve', { caseId });
+  const txHash = await sendInvoke(provider, [{ contract_address: CONTRACT_ADDRESS, entry_point: 'resolve', calldata: [String(caseId)] }]);
+  await waitForReceipt(txHash);
+  return txHash;
+}
+
+// MAINNET POOL, not built yet: goes through privacy_invoke(Claim, ...)
+// on the pool side using the claimSecret from submitCommitMove.
+async function submitClaim(){
+  throw new Error('claiming requires the live STRK20 pool, not wired yet on Sepolia');
+}
+
+async function queryPublicStrkBalance(address){
+  // Testnet-only stand-in, swap for a real STRK20 shielded balance query
+  // before mainnet.
+  const response = await sepoliaRpc.callContract({
+    contractAddress: SEPOLIA_STRK_ADDRESS,
+    entrypoint: 'balanceOf',
+    calldata: [address],
+  });
+  log('queryPublicStrkBalance: raw response', response);
+  // callContract's return shape varies by starknet.js version. This was
+  // the actual balance bug last time: the old code assumed response was
+  // always a plain array and read response[0] directly.
+  const result = Array.isArray(response) ? response : (response?.result ?? []);
+  const low = BigInt(result[0] ?? 0);
+  const high = BigInt(result[1] ?? 0);
+  const value = Number((high << 128n) + low) / 1e18;
+  log('queryPublicStrkBalance: parsed value', value);
+  return value;
+}
+
+// ---------------------------------------------------------------
+// Shared open cases board, built from CaseCreated events. There's no
+// real indexer here, this scans events directly from the RPC node,
+// fine at hackathon scale, worth replacing with a proper indexer if
+// case volume grows a lot before mainnet.
+// ---------------------------------------------------------------
+
+async function fetchOpenCases(gameKey){
+  const gameIndex = GAME_TYPE_INDEX[gameKey];
+  const candidates = [];
+  let continuationToken = undefined;
+  let guard = 0;
+
+  do {
+    const resp = await sepoliaRpc.getEvents({
+      address: CONTRACT_ADDRESS,
+      from_block: { block_number: 0 },
+      to_block: 'latest',
+      keys: [[CASE_CREATED_SELECTOR]],
+      chunk_size: 50,
+      continuation_token: continuationToken,
+    });
+    log('fetchOpenCases: event page', resp);
+    for(const ev of (resp.events||[])){
+      const caseId = feltToBigInt(ev.keys[1]);
+      const data = (ev.data||[]).map(feltToBigInt);
+      const evGameType = Number(data[1]);
+      const stakeAmount = data[2];
+      const joinDeadline = Number(data[3]);
+      if(evGameType !== gameIndex) continue;
+      candidates.push({ caseId, stakeAmount, joinDeadline });
+    }
+    continuationToken = resp.continuation_token;
+    guard++;
+  } while(continuationToken && guard < 20);
+
+  const now = Math.floor(Date.now()/1000);
+  const open = [];
+  for(const c of candidates){
+    if(c.joinDeadline <= now) continue;
+    try {
+      const entry = await readCase(c.caseId);
+      if(entry.opponent === 0n) open.push({ caseId: c.caseId, stakeDecimal: Number(c.stakeAmount)/1e18 });
+    } catch(err) { log('fetchOpenCases: could not read case', c.caseId, err); }
+  }
+  log('fetchOpenCases: open cases for', gameKey, open);
+  return open;
+}
+
+// ---------------------------------------------------------------
+// Round state and polling
+// ---------------------------------------------------------------
+
 let MY_ROUNDS = {};
 
-function newRound({game, stake, role, joinMs}){
+function newRound({game, stake, role, joinMs, caseId}){
   const slug = randomSlug();
   const round = {
-    slug, game, stake, role, // role: 'creator' | 'joiner'
+    slug, game, stake, role, caseId,
     stage: role==='creator' ? 'share' : 'matched',
     createdAt: Date.now(),
     joinDeadline: Date.now() + (joinMs||0),
     filledAt: role==='joiner' ? Date.now() : null,
     moveDeadline: role==='joiner' ? Date.now()+MOVE_WINDOW_MS : null,
-    myMoved:false, oppMoved:false,
+    myMoved:false, oppMoved:false, myRevealed:false, oppRevealed:false,
     myMove:null, oppMove:null,
-    myCard:null, oppCard:null, pot:0, betLog:[], outcomeKind:null,
+    myCard:null, oppCard:null, pot:stake*2, betLog:[], outcomeKind:null,
     myRole:null, myPicks:[], oppPicks:[],
     outcome:null, recorded:false,
+    pendingReveal:null, claimSecret:null, pollTimer:null,
   };
   MY_ROUNDS[slug] = round;
   return round;
 }
 
-function dealBluffCards(round){ round.myCard=drawCard(); round.oppCard=drawCard(); round.pot=round.stake*2; }
-
-function startAssassinRole(round){
-  // real version derives role from hash(commitmentA, commitmentB), neither
-  // player controls both so neither can bias their own role, mocked here
-  round.myRole = Math.random()<0.5 ? 'assassin' : 'target';
+function startCasePolling(round){
+  round.pollTimer = setInterval(async ()=>{
+    if(round.stage==='expired' || round.stage==='result'){ clearInterval(round.pollTimer); return; }
+    try {
+      const entry = await readCase(round.caseId);
+      await applyChainState(round, entry);
+    } catch(err) { logError('case poll failed', err); }
+  }, 4000);
 }
 
-// simulates the other player acting on their own schedule, so my cases
-// has something real to resume into even after switching tabs
-function scheduleMockOpponent(round){
-  if(round.role==='creator'){
-    const joinDelay = 2500 + Math.random()*4000;
-    setTimeout(()=>{
-      if(round.stage==='expired' || round.stage==='resolved') return;
-      const list = CASES[round.game];
-      const i = list.findIndex(c=>c.slug===round.slug);
-      if(i>-1) list.splice(i,1);
-      round.filledAt = Date.now();
-      round.moveDeadline = Date.now() + MOVE_WINDOW_MS;
-      if(round.stage==='waiting' || round.stage==='share') round.stage='matched';
-      maybeScheduleOpponentMove(round, 2000 + Math.random()*5000);
-      touch(round.slug);
-    }, joinDelay);
-  } else {
-    // creator may have already moved while waiting, simulate that split
-    if(Math.random() < 0.4){ setOpponentMove(round); }
-    else { maybeScheduleOpponentMove(round, 3000 + Math.random()*6000); }
-  }
+function outcomeFromChain(entry, iAmA){
+  if(entry.outcome === 1) return iAmA ? 'win' : 'lose';
+  if(entry.outcome === 2) return iAmA ? 'lose' : 'win';
+  return 'tie';
 }
 
-function maybeScheduleOpponentMove(round, delay){
-  setTimeout(()=>{
-    if(round.stage==='expired' || round.stage==='resolved' || round.oppMoved) return;
-    setOpponentMove(round);
-    touch(round.slug);
-  }, delay);
-}
+function applyRevealedMoves(round, entry){
+  const iAmA = round.role==='creator';
+  const oppValue = iAmA ? entry.revealedMoveB : entry.revealedMoveA;
 
-function setOpponentMove(round){
-  round.oppMoved = true;
-  const engine = GAMES[round.game].engine;
-  if(engine==='simul'){
+  if(round.game==='rps' || round.game==='pd'){
     const opts = SIMUL_CONFIG[round.game].options;
-    round.oppMove = opts[Math.floor(Math.random()*opts.length)].id;
-  } else if(engine==='bluff'){
-    if(!round.oppCard) dealBluffCards(round);
-  } else if(engine==='assassin'){
-    const all=[0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15];
-    round.oppPicks = all.sort(()=>Math.random()-0.5).slice(0,3);
+    const idx = Number(oppValue);
+    if(opts[idx]) round.oppMove = opts[idx].id;
+  } else if(round.game==='assassin'){
+    const v = Number(oppValue);
+    round.oppPicks = [v % 16, Math.floor(v/16) % 16, Math.floor(v/256) % 16];
+  } else if(round.game==='bluff'){
+    const v = Number(oppValue);
+    const action = v % 2;
+    const cardIdx = Math.floor(v/2);
+    round.oppCard = RANKS[cardIdx];
+    if(round.role==='creator') round.outcomeKind = action===0 ? 'fold-opp' : null;
+    else round.outcomeKind = action===0 ? 'creator-folded' : null;
   }
-  if(round.myMoved) resolveRound(round);
 }
 
-// re-render only if this round is the one currently on screen
-function touch(slug){ if(state.activeSlug===slug) render(); updateMyCasesBadge(); if(document.getElementById('myCasesOverlay').classList.contains('open')) openMyCases(); }
-
-function resolveRound(round){
+function finalizeFromChain(round, entry){
   if(round.recorded) return;
-  const engine = GAMES[round.game].engine;
-  let label, delta;
-
-  if(engine==='simul'){
-    const outcome = SIMUL_CONFIG[round.game].resolve(round.myMove, round.oppMove);
-    round.outcome = outcome;
-    label = outcome;
-    delta = outcome==='win' ? round.stake : outcome==='lose' ? -round.stake : 0;
-  } else if(engine==='bluff'){
-    const mine=rankValue(round.myCard), theirs=rankValue(round.oppCard);
-    const outcome = mine===theirs?'tie':mine>theirs?'win':'lose';
-    round.outcome = outcome;
-    label = outcome;
-    delta = outcome==='win' ? round.stake : outcome==='lose' ? -round.stake : 0;
-  } else {
-    const assassinPicks = round.myRole==='assassin' ? round.myPicks : round.oppPicks;
-    const targetPicks = round.myRole==='target' ? round.myPicks : round.oppPicks;
-    const overlap = assassinPicks.filter(t=>targetPicks.includes(t));
-    const tier = overlap.length===0 ? 'escape' : overlap.length===1 ? 'graze' : 'kill';
-    const outcome = round.myRole==='assassin' ? (tier==='escape'?'lose':tier==='graze'?'partial':'win') : (tier==='escape'?'win':tier==='graze'?'partial':'lose');
-    round.outcome = outcome;
-    round.tier = tier;
-    const myShare = tier==='escape' ? (round.myRole==='target'?1:0) : tier==='kill' ? (round.myRole==='assassin'?1:0) : (round.myRole==='assassin'?0.65:0.35);
-    round.myShare = myShare;
-    label = outcome==='partial' ? 'tie' : outcome;
-    delta = (round.stake*2*myShare) - round.stake;
-  }
-
+  applyRevealedMoves(round, entry);
+  const iAmA = round.role==='creator';
+  const outcome = outcomeFromChain(entry, iAmA);
+  round.outcome = outcome;
   round.stage = 'result';
   round.recorded = true;
-  recordResult(round.game, round.stake, label, delta);
+  const delta = outcome==='win' ? round.stake : outcome==='lose' ? -round.stake : 0;
+  recordResult(round.game, round.stake, outcome, delta);
+  if(round.pollTimer) clearInterval(round.pollTimer);
+  log('finalizeFromChain', round.slug, outcome);
 }
 
-// resolves a round when the move window runs out instead of both moving
+async function applyChainState(round, entry){
+  let changed = false;
+  const iAmA = round.role==='creator';
+
+  if((round.stage==='share' || round.stage==='waiting') && entry.opponent !== 0n){
+    round.stage = 'matched';
+    round.moveDeadline = entry.moveDeadline*1000;
+    changed = true;
+    log('applyChainState: opponent joined', round.slug);
+  }
+
+  const oppCommitted = iAmA ? entry.hasCommittedB : entry.hasCommittedA;
+  const oppRevealedNow = iAmA ? entry.hasRevealedB : entry.hasRevealedA;
+  if(oppCommitted && !round.oppMoved){ round.oppMoved = true; changed = true; }
+  if(oppRevealedNow && !round.oppRevealed){ round.oppRevealed = true; changed = true; }
+
+  const bothCommitted = entry.hasCommittedA && entry.hasCommittedB;
+  if(round.game!=='bluff' && bothCommitted && round.pendingReveal && !round.myRevealed){
+    round.myRevealed = true;
+    try {
+      await submitRevealMove({ provider: account.provider, caseId: round.caseId, moveValue: round.pendingReveal.moveValue, salt: round.pendingReveal.salt });
+    } catch(err){ logError('auto-reveal failed', err); round.myRevealed = false; }
+    changed = true;
+  }
+
+  const bothRevealed = entry.hasRevealedA && entry.hasRevealedB;
+  if(entry.outcome === 0 && bothRevealed){
+    try { await submitResolve({ provider: account.provider, caseId: round.caseId }); }
+    catch(err){ log('resolve call failed, will retry on next poll', err); }
+  }
+
+  if(entry.outcome !== 0){
+    finalizeFromChain(round, entry);
+    changed = true;
+  }
+
+  if(changed) touch(round.slug);
+}
+
 function resolveOnTimeout(round){
   if(round.recorded) return;
   if(round.myMoved && !round.oppMoved){
@@ -232,20 +437,11 @@ function resolveOnTimeout(round){
     round.outcome = 'tie'; round.stage='result'; round.recorded=true;
     recordResult(round.game, round.stake, 'tie', 0);
     round.timeoutNote = 'Neither side moved in time \u2014 no-fault refund, stakes returned.';
-  } else {
-    resolveRound(round);
   }
 }
 
-function expireRound(round){
-  round.stage = 'expired';
-  PROFILE.balance += round.stake;
-  const list = CASES[round.game];
-  const i = list.findIndex(c=>c.slug===round.slug);
-  if(i>-1) list.splice(i,1);
-}
+function expireRound(round){ round.stage = 'expired'; }
 
-// checks every round once a second for expired join/move windows
 setInterval(()=>{
   let needsRender = false;
   Object.values(MY_ROUNDS).forEach(round=>{
@@ -283,11 +479,13 @@ function updateMyCasesBadge(){
   if(n>0){ badge.style.display='flex'; badge.textContent = n; } else { badge.style.display='none'; }
 }
 
+function touch(slug){ if(state.activeSlug===slug) render(); updateMyCasesBadge(); if(document.getElementById('myCasesOverlay').classList.contains('open')) openMyCases(); }
+
 let account = null;
 
 let state = {
   game:'rps',
-  view:'board', // 'board' | 'lobby', only used when activeSlug is null
+  view:'board',
   activeSlug:null,
   draft:{ stake:1, joinMs:JOIN_PRESETS[1].ms, customOn:false, customVal:1, customUnit:'hours' },
 };
@@ -312,20 +510,14 @@ function detectWallets() {
   if (window.starknet_braavos) wallets.push({ id: 'braavos', name: 'Braavos', provider: window.starknet_braavos });
   if (window.starknet_xverse) wallets.push({ id: 'xverse', name: 'Xverse', provider: window.starknet_xverse });
   if (wallets.length === 0 && window.starknet) wallets.push({ id: 'starknet', name: window.starknet.name || 'Starknet Wallet', provider: window.starknet });
+  log('detectWallets', wallets.map(w=>w.name));
   return wallets;
 }
 
-// WalletAccountV6 reaches STRK20 through the standard wallet API feature. Some
-// injected wallets also expose the same request function at the top level, so
-// support both shapes without assuming either one.
 function walletApiRequest(provider) {
   const walletApi = provider?.features?.['starknet:walletApi'];
-  if (walletApi && typeof walletApi.request === 'function') {
-    return walletApi.request.bind(walletApi);
-  }
-  if (provider && typeof provider.request === 'function') {
-    return provider.request.bind(provider);
-  }
+  if (walletApi && typeof walletApi.request === 'function') return walletApi.request.bind(walletApi);
+  if (provider && typeof provider.request === 'function') return provider.request.bind(provider);
   return null;
 }
 
@@ -336,80 +528,85 @@ function isNotRegisteredError(err) {
 }
 
 async function supportsStrk20(provider) {
-  // A caller may already have a WalletAccountV6 rather than the injected
-  // wallet object. In that case starknet.js exposes the typed method directly.
   if (typeof provider?.strk20Balances === 'function') {
     try {
-      await provider.strk20Balances([]);
+      const res = await provider.strk20Balances([]);
+      log('supportsStrk20: direct strk20Balances() succeeded', res);
       return true;
     } catch (err) {
+      log('supportsStrk20: direct strk20Balances() threw, checking if it means NOT_REGISTERED', err);
       return isNotRegisteredError(err);
     }
   }
 
   const request = walletApiRequest(provider);
-  if (!request) return false;
+  if (!request) {
+    log('supportsStrk20: no request() function found on this provider at all, see window.starknet_argentX in the console to check what it actually exposes');
+    return false;
+  }
 
-  // This is a capability probe, not a balance check. An address that has
-  // never entered the pool is valid and returns NOT_REGISTERED.
   try {
-    await request({ type: 'wallet_strk20Balances', params: { tokens: [] } });
+    const res = await request({ type: 'wallet_strk20Balances', params: { tokens: [] } });
+    log('supportsStrk20: wallet_strk20Balances succeeded', res);
     return true;
   } catch (err) {
-    return isNotRegisteredError(err);
+    const registered = isNotRegisteredError(err);
+    log('supportsStrk20: wallet_strk20Balances threw', { code: err?.code, message: err?.message, raw: err }, 'treating as supported?', registered);
+    if (!registered) {
+      log('supportsStrk20: this error was not recognized as NOT_REGISTERED. If Ready X genuinely does support STRK20, the method name or params shape here may not match this wallet version. Run window.starknet_argentX in the console and compare its real methods against what this function assumes.');
+    }
+    return registered;
   }
 }
 
-// talks straight to the injected wallet object
 async function connectAccount(){
   const wallets = detectWallets();
   if(wallets.length === 0){
     alert('no starknet wallet found, install Ready X or Xverse');
     return null;
   }
-
-  // more than one installed, just take the first for now, a proper
-  // picker is a nice-to-have once this is confirmed working
   const provider = wallets[0].provider;
-
+  log('connectAccount: using', wallets[0].name);
   try {
     const accounts = await provider.request({ type: 'wallet_requestAccounts' });
+    log('connectAccount: accounts', accounts);
     const address = Array.isArray(accounts) ? accounts[0] : accounts;
     if(!address) return null;
 
-    if(!(await supportsStrk20(provider))){
-      alert("this wallet doesn't support STRK20 private actions yet, try Ready X or Xverse");
+    const supported = await supportsStrk20(provider);
+    log('connectAccount: supportsStrk20 result', supported);
+    if(!supported){
+      alert("this wallet doesn't support STRK20 private actions yet, try Ready X or Xverse. Check the console for details on why the check failed.");
       return null;
     }
 
-    return { address, provider };
+    let publicBalance = null;
+    try { publicBalance = await queryPublicStrkBalance(address); }
+    catch (balanceErr) { logError('could not read public Sepolia STRK balance', balanceErr); }
+    log('connectAccount: connected', { address, publicBalance });
+    return { address, provider, publicBalance };
   } catch (err) {
-    console.error(err);
+    logError('connectAccount failed', err);
     alert('could not connect, make sure your wallet is unlocked and try again');
     return null;
   }
 }
 
-// visible only to this user, saved to localStorage keyed by wallet address
-// so it comes back on reconnect but never leaves the device
 let PROFILE = {
   username: generateUsername(),
-  balance: 12.4,
+  balance: 0,
   gamesPlayed:0, wins:0, losses:0, ties:0,
   totalStaked:0, totalWon:0,
   currentStreak:0, bestStreak:0,
   gameCounts:{ rps:0, pd:0, bluff:0, assassin:0 },
 };
 
-function saveProfile(){
-  if(!account) return;
-  localStorage.setItem(`hidden_profile_${account.address}`, JSON.stringify(PROFILE));
-}
-
+function saveProfile(){ if(account) localStorage.setItem(`hidden_profile_${account.address}`, JSON.stringify(PROFILE)); }
 function loadProfile(){
   const raw = localStorage.getItem(`hidden_profile_${account.address}`);
-  if(raw){ PROFILE = JSON.parse(raw); return; }
-  PROFILE.username = generateUsername(); // first time this wallet's connected here
+  if(raw) PROFILE = JSON.parse(raw);
+  else PROFILE.username = generateUsername();
+  if(account.publicBalance != null) PROFILE.balance = account.publicBalance;
 }
 
 function profileTitle(){
@@ -427,19 +624,16 @@ function recordResult(gameKey, stake, label, deltaStrk){
   PROFILE.totalStaked += stake;
   PROFILE.balance += deltaStrk;
   if(deltaStrk > 0) PROFILE.totalWon += deltaStrk;
-
   if(label==='win'){ PROFILE.wins++; PROFILE.currentStreak = PROFILE.currentStreak>0?PROFILE.currentStreak+1:1; }
   else if(label==='lose'){ PROFILE.losses++; PROFILE.currentStreak = PROFILE.currentStreak<0?PROFILE.currentStreak-1:-1; }
   else { PROFILE.ties++; PROFILE.currentStreak = 0; }
   if(Math.abs(PROFILE.currentStreak) > Math.abs(PROFILE.bestStreak)) PROFILE.bestStreak = PROFILE.currentStreak;
-
   saveProfile();
 }
 
 function renderSideProfile(){
   const el = document.getElementById('sideProfile');
   if(!el) return;
-
   if(!account){
     el.innerHTML = `
       <div class="profile-card torn">
@@ -447,14 +641,9 @@ function renderSideProfile(){
         <button class="btn3 wide" id="sideConnectBtn" style="margin-top:12px;">Connect wallet</button>
       </div>
     `;
-    document.getElementById('sideConnectBtn').onclick = async ()=>{
-      account = await connectAccount();
-      if(account) loadProfile();
-      render();
-    };
+    document.getElementById('sideConnectBtn').onclick = async ()=>{ account = await connectAccount(); if(account) loadProfile(); render(); };
     return;
   }
-
   const winRate = PROFILE.gamesPlayed ? Math.round((PROFILE.wins/PROFILE.gamesPlayed)*100) : 0;
   el.innerHTML = `
     <div class="profile-card torn" id="sideProfileCard">
@@ -477,7 +666,6 @@ function renderSideProfile(){
 
 function openProfile(){
   const overlay = document.getElementById('profileOverlay');
-
   if(!account){
     overlay.innerHTML = `
       <div class="panel torn profile-full">
@@ -487,15 +675,10 @@ function openProfile(){
       </div>
     `;
     document.getElementById('closeProfileBtn').onclick = closeProfile;
-    document.getElementById('fullConnectBtn').onclick = async ()=>{
-      account = await connectAccount();
-      if(account) loadProfile();
-      openProfile();
-    };
+    document.getElementById('fullConnectBtn').onclick = async ()=>{ account = await connectAccount(); if(account) loadProfile(); openProfile(); };
     overlay.classList.add('open');
     return;
   }
-
   const winRate = PROFILE.gamesPlayed ? Math.round((PROFILE.wins/PROFILE.gamesPlayed)*100) : 0;
   const favEntry = Object.entries(PROFILE.gameCounts).sort((a,b)=>b[1]-a[1])[0];
   const favName = favEntry && favEntry[1]>0 ? GAMES[favEntry[0]].name : '\u2014';
@@ -541,7 +724,7 @@ function caseRowStatus(round){
     if(round.myMoved && !round.oppMoved) return { text:`You moved \u2014 waiting on opponent (${formatCountdown(round.moveDeadline-Date.now())} left)`, urgent:false };
     return { text:`Opponent connected \u2014 make your move (${formatCountdown(round.moveDeadline-Date.now())} left)`, urgent:false };
   }
-  if(['choose','locked','dealt','pending-call','showdown','picking'].includes(round.stage)) return { text:'In progress \u2014 resume to continue', urgent:false };
+  if(['choose','locked','dealt','pending-call','showdown','picking','resolving'].includes(round.stage)) return { text:'In progress \u2014 resume to continue', urgent:false };
   if(round.stage==='result') return { text: round.outcome==='win' ? 'Resolved \u2014 you won' : round.outcome==='lose' ? 'Resolved \u2014 you lost' : 'Resolved \u2014 tie/refund', urgent:false };
   if(round.stage==='expired') return { text:'Expired \u2014 refunded', urgent:false };
   return { text:round.stage, urgent:false };
@@ -587,7 +770,6 @@ function render(){
   renderSideProfile();
   updateMyCasesBadge();
   const el = document.getElementById('stage');
-
   if(state.activeSlug){
     const round = MY_ROUNDS[state.activeSlug];
     if(!round){ state.activeSlug=null; state.view='board'; renderBoard(el); return; }
@@ -608,46 +790,87 @@ function renderTabs(){
   });
 }
 
+// Real shared board, built from CaseCreated events across all wallets.
 function renderBoard(el){
-  const cases = CASES[state.game];
   el.innerHTML = `
     <div class="section-label">open cases \u2014 ${GAMES[state.game].name}</div>
-    <div class="board">
+    <div class="panel-hint" id="boardStatus" style="margin-bottom:16px;">Loading open cases from the chain...</div>
+    <div class="board" id="boardGrid"></div>
+    <div class="section-label" style="margin-top:24px;">Have a specific case ID?</div>
+    <div class="stake-input-row">
+      <input type="text" id="joinCaseIdInput" placeholder="case id">
+    </div>
+    <button class="btn3 wide" id="joinByIdBtn" style="margin-top:10px;">Join by ID</button>
+  `;
+  document.getElementById('joinByIdBtn').onclick = ()=> joinCaseById(document.getElementById('joinCaseIdInput').value.trim());
+  loadBoard();
+}
+
+async function loadBoard(){
+  const grid = document.getElementById('boardGrid');
+  const status = document.getElementById('boardStatus');
+  if(!grid) return;
+  try {
+    const cases = await fetchOpenCases(state.game);
+    if(document.getElementById('boardGrid') !== grid) return; // navigated away already
+    status.textContent = cases.length
+      ? 'Live from the chain.'
+      : 'No open cases right now. Post one below, or join a specific case by ID.';
+    grid.innerHTML = `
       ${cases.map((c,i)=>`
         <div class="case-card torn enter" style="animation-delay:${Math.min(i,6)*45}ms;">
           <div class="pin"></div>
-          <div class="stake-big">${c.stake}<span class="stake-unit">STRK</span></div>
-          <div class="case-sub">stake \u00b7 open case</div>
-          <button class="btn3 wide small" style="margin-top:14px;" data-i="${i}">Join</button>
+          <div class="stake-big">${c.stakeDecimal}<span class="stake-unit">STRK</span></div>
+          <div class="case-sub">case #${c.caseId}</div>
+          <button class="btn3 wide small" style="margin-top:14px;" data-case="${c.caseId}">Join</button>
         </div>
       `).join('')}
       <div class="create-card enter" id="createCard" style="animation-delay:${Math.min(cases.length,6)*45}ms;">
         <div class="plus">+</div>
         <div class="lbl">POST NEW CASE</div>
       </div>
-    </div>
-  `;
-  el.querySelectorAll('[data-i]').forEach(b=>{ b.onclick = ()=> joinBoardCase(parseInt(b.dataset.i,10)); });
-  document.getElementById('createCard').onclick = goToCreate;
+    `;
+    grid.querySelectorAll('[data-case]').forEach(b=>{ b.onclick = ()=> joinCaseById(b.dataset.case); });
+    document.getElementById('createCard').onclick = goToCreate;
+  } catch(err) {
+    logError('loadBoard failed', err);
+    if(status) status.textContent = 'Could not load the board, check console for details.';
+  }
 }
 
-// joining stakes into a case too, so it needs a wallet the same as creating one
-async function joinBoardCase(index){
+async function joinCaseById(caseIdRaw){
+  if(!caseIdRaw) return;
   if(!account){
     account = await connectAccount();
     if(!account) return;
     loadProfile();
   }
+  const btn = document.getElementById('joinByIdBtn');
+  if(btn){ btn.textContent='Joining...'; btn.disabled=true; }
+  try {
+    const caseId = BigInt(caseIdRaw);
+    const entry = await readCase(caseId);
+    if(entry.opponent !== 0n) throw new Error('this case has already been joined');
+    await submitJoinCase({ provider: account.provider, caseId });
+    const round = newRound({ game: state.game, stake: Number(entry.stakeAmount)/1e18, role:'joiner', caseId });
+    round.moveDeadline = Date.now() + MOVE_WINDOW_MS;
+    if(state.game==='assassin') await startAssassinRole(round);
+    startCasePolling(round);
+    openRound(round.slug);
+  } catch(err) {
+    logError('joinCaseById failed', err);
+    alert('could not join that case, double check the ID and try again');
+  } finally {
+    if(btn){ btn.textContent='Join by ID'; btn.disabled=false; }
+  }
+}
 
-  const list = CASES[state.game];
-  const c = list[index];
-  if(!c) return;
-  list.splice(index,1);
-  const round = newRound({ game: state.game, stake: c.stake, role:'joiner' });
-  const engine = GAMES[state.game].engine;
-  if(engine==='assassin') startAssassinRole(round);
-  scheduleMockOpponent(round);
-  openRound(round.slug);
+async function startAssassinRole(round){
+  if(round.myRole) return round.myRole;
+  const entry = await readCase(round.caseId);
+  const creatorIsMe = round.role === 'creator';
+  round.myRole = entry.assassinIsA === creatorIsMe ? 'assassin' : 'target';
+  return round.myRole;
 }
 
 function renderLobby(el){
@@ -658,11 +881,7 @@ function renderLobby(el){
         <button class="btn3 wide" id="lobbyConnectBtn" style="margin-top:12px;">Connect wallet</button>
       </div>
     `;
-    document.getElementById('lobbyConnectBtn').onclick = async ()=>{
-      account = await connectAccount();
-      if(account) loadProfile();
-      render();
-    };
+    document.getElementById('lobbyConnectBtn').onclick = async ()=>{ account = await connectAccount(); if(account) loadProfile(); render(); };
     return;
   }
 
@@ -694,7 +913,7 @@ function renderLobby(el){
       ` : ''}
 
       <button class="btn3 wide" id="createBtn" style="margin-top:20px;">Post case</button>
-      <div class="panel-hint">Stake shields on deposit \u2014 the pool sees an amount arrive, not which wallet sent it. If nobody joins before your timer runs out, you're refunded automatically.</div>
+      <div class="panel-hint">This creates a real case on Sepolia and appears on the shared board for anyone to join. Stake movement through the privacy pool isn't wired yet, so nothing actually moves out of your wallet on this pass.</div>
     </div>
   `;
   document.getElementById('backBtn').onclick = ()=> goToBoard();
@@ -714,6 +933,7 @@ function renderRound(el, round){
   if(round.stage==='share'){ renderSharePanel(el, round); return; }
   if(round.stage==='waiting'){ renderWaitingPanel(el, round); return; }
   if(round.stage==='matched'){ renderMatchedPanel(el, round); return; }
+  if(round.stage==='resolving'){ renderResolvingPanel(el); return; }
   if(round.stage==='expired'){ renderExpiredPanel(el, round); return; }
 
   const engine = GAMES[round.game].engine;
@@ -722,23 +942,32 @@ function renderRound(el, round){
   else renderAssassinPlay(el, round);
 }
 
+function renderResolvingPanel(el){
+  el.innerHTML = `
+    <div class="panel torn enter">
+      <div class="panel-title">Resolving</div>
+      <div class="panel-hint" style="text-align:center;">Your move is in, waiting for the chain to confirm the result...</div>
+    </div>
+  `;
+}
+
 function renderSharePanel(el, round){
   el.innerHTML = `
     <div class="panel torn enter">
       <div class="panel-title">Case is live</div>
       <div class="share-hero">
-        <div class="panel-hint" style="text-align:center;">Share this directly with someone to fill it fast \u2014 or leave it on the open board and wait.</div>
-        <div class="big-link">${caseLink(round.slug)}</div>
+        <div class="panel-hint" style="text-align:center;">Anyone can find this on the open board now, or you can send the case ID directly.</div>
+        <div class="big-link">${caseLink(round.caseId)}</div>
         <div class="share-actions">
           <button class="btn3 wide" id="shareBtn">Share link</button>
-          <button class="btn3 outline wide" id="waitBtn">I'll wait on the board</button>
+          <button class="btn3 outline wide" id="waitBtn">I'll wait for them here</button>
         </div>
       </div>
     </div>
   `;
   document.getElementById('shareBtn').onclick = async (e)=>{
-    if(navigator.share){ try{ await navigator.share({ url:'https://'+caseLink(round.slug), title:'HIDDEN', text:`Join my ${GAMES[round.game].name} case on HIDDEN` }); }catch(err){} }
-    else { navigator.clipboard?.writeText(caseLink(round.slug)).catch(()=>{}); e.target.textContent='Copied'; setTimeout(()=>{e.target.textContent='Share link';},1400); }
+    if(navigator.share){ try{ await navigator.share({ url:'https://'+caseLink(round.caseId), title:'HIDDEN', text:`Join my ${GAMES[round.game].name} case on HIDDEN, case #${round.caseId}` }); }catch(err){} }
+    else { navigator.clipboard?.writeText(caseLink(round.caseId)).catch(()=>{}); e.target.textContent='Copied'; setTimeout(()=>{e.target.textContent='Share link';},1400); }
   };
   document.getElementById('waitBtn').onclick = ()=>{ round.stage='waiting'; render(); };
 }
@@ -748,28 +977,26 @@ function renderWaitingPanel(el, round){
     <div class="panel torn enter">
       <div class="pulse-wrap">
         <div class="pulse-dot"></div>
-        <div class="waiting-msg">Watching for someone to join case ${round.slug.slice(0,6)}...<br><span class="countdown" id="joinCountdown">${formatCountdown(round.joinDeadline-Date.now())}</span> left to join</div>
+        <div class="waiting-msg">Watching case #${round.caseId} for an opponent...<br><span class="countdown" id="joinCountdown">${formatCountdown(round.joinDeadline-Date.now())}</span> left to join</div>
       </div>
       <div class="link-box">
-        <code>${caseLink(round.slug)}</code>
+        <code>${caseLink(round.caseId)}</code>
         <button class="btn3 small" id="copyBtn">Copy</button>
       </div>
-      <div class="panel-hint">If nobody joins before the timer runs out, you're refunded automatically \u2014 no action needed.</div>
-      <button class="btn3 outline wide" id="cancelBtn" style="margin-top:16px;">Cancel &amp; reclaim stake now</button>
+      <div class="panel-hint">This case is visible on the open board to anyone right now. Checking the chain every few seconds.</div>
     </div>
   `;
   document.getElementById('copyBtn').onclick = (e)=>{
-    navigator.clipboard?.writeText(caseLink(round.slug)).catch(()=>{});
+    navigator.clipboard?.writeText(caseLink(round.caseId)).catch(()=>{});
     e.target.textContent='Copied'; setTimeout(()=>{e.target.textContent='Copy';},1400);
   };
-  document.getElementById('cancelBtn').onclick = ()=>{ expireRound(round); goToBoard(); };
 }
 
 function renderExpiredPanel(el, round){
   el.innerHTML = `
     <div class="panel torn enter">
       <div class="panel-title">Case expired</div>
-      <div class="panel-hint">Nobody joined in time. Your ${round.stake} STRK stake has been refunded to your shielded balance.</div>
+      <div class="panel-hint">Nobody joined in time.</div>
       <button class="btn3 wide" id="backBoardBtn" style="margin-top:16px;">Back to open cases</button>
     </div>
   `;
@@ -778,8 +1005,11 @@ function renderExpiredPanel(el, round){
 
 function renderMatchedPanel(el, round){
   const urgent = needsMyAttention(round);
+  const bluffJoinerWaiting = round.game==='bluff' && round.role==='joiner' && !round.oppRevealed;
   let statusHtml;
-  if(urgent){
+  if(bluffJoinerWaiting){
+    statusHtml = `<div class="status-banner">Waiting for the other player to bet or fold before you can act.</div>`;
+  } else if(urgent){
     statusHtml = `<div class="status-banner urgent">Opponent has made their move. You have <span class="countdown" id="moveCountdown">${formatCountdown(round.moveDeadline-Date.now())}</span> left to move, or you forfeit the pot.</div>`;
   } else if(round.myMoved && !round.oppMoved){
     statusHtml = `
@@ -798,16 +1028,16 @@ function renderMatchedPanel(el, round){
     <div class="panel torn enter">
       <div class="panel-title">Opponent connected</div>
       ${statusHtml}
-      ${!round.myMoved ? `<button class="btn3 wide" id="moveBtn" style="margin-top:14px;">Make your move</button>` : ''}
+      ${!round.myMoved && !bluffJoinerWaiting ? `<button class="btn3 wide" id="moveBtn" style="margin-top:14px;">Make your move</button>` : ''}
       <button class="btn3 outline wide" id="laterBtn" style="margin-top:${round.myMoved?'14':'10'}px;">Back to board (resume later)</button>
     </div>
   `;
-  if(!round.myMoved){
-    document.getElementById('moveBtn').onclick = ()=>{
+  if(!round.myMoved && !bluffJoinerWaiting){
+    document.getElementById('moveBtn').onclick = async ()=>{
       const engine = GAMES[round.game].engine;
       if(engine==='simul') round.stage='choose';
-      else if(engine==='bluff'){ if(!round.myCard) dealBluffCards(round); round.stage='dealt'; }
-      else { if(!round.myRole) startAssassinRole(round); round.stage='picking'; }
+      else if(engine==='bluff'){ if(!round.myCard) round.myCard = drawCard(); round.stage='dealt'; }
+      else { if(!round.myRole) await startAssassinRole(round); round.stage='picking'; }
       render();
     };
   }
@@ -816,40 +1046,55 @@ function renderMatchedPanel(el, round){
 
 function renderSimulPlay(el, round){
   const cfg = SIMUL_CONFIG[round.game];
+  if(round.stage!=='choose') return;
 
-  if(round.stage==='choose'){
-    el.innerHTML = `
-      <div class="panel torn enter">
-        <div class="panel-title">Select your move</div>
-        <div class="section-label" style="margin-top:14px;">${cfg.chooseCopy}</div>
-        <div class="tiles c${cfg.cols}">
-          ${cfg.options.map(m=>`<button class="tile" data-id="${m.id}">
-            <div class="glyph">${iconSpan(m.icon,28)}</div><div class="label">${m.label}</div>
-            ${m.sub?`<div class="sub">${m.sub}</div>`:''}
-          </button>`).join('')}
-        </div>
-        <button class="btn3 wide" id="lockBtn" disabled>Lock move</button>
-        <div class="panel-hint">${cfg.lockCopy}</div>
+  el.innerHTML = `
+    <div class="panel torn enter">
+      <div class="panel-title">Select your move</div>
+      <div class="section-label" style="margin-top:14px;">${cfg.chooseCopy}</div>
+      <div class="tiles c${cfg.cols}">
+        ${cfg.options.map(m=>`<button class="tile" data-id="${m.id}">
+          <div class="glyph">${iconSpan(m.icon,28)}</div><div class="label">${m.label}</div>
+          ${m.sub?`<div class="sub">${m.sub}</div>`:''}
+        </button>`).join('')}
       </div>
-    `;
-    let picked=null;
-    el.querySelectorAll('.tile').forEach(t=>{
-      t.onclick = ()=>{
-        el.querySelectorAll('.tile').forEach(x=>x.classList.remove('picked'));
-        t.classList.add('picked'); picked=t.dataset.id;
-        document.getElementById('lockBtn').disabled=false;
-      };
-    });
-    document.getElementById('lockBtn').onclick = ()=> commitMove(()=>{
-      round.myMove = picked; round.myMoved = true;
-      if(round.oppMoved) resolveRound(round); else round.stage='matched';
+      <button class="btn3 wide" id="lockBtn" disabled>Lock move</button>
+      <div class="panel-hint">${cfg.lockCopy}</div>
+    </div>
+  `;
+  let picked=null;
+  el.querySelectorAll('.tile').forEach(t=>{
+    t.onclick = ()=>{
+      el.querySelectorAll('.tile').forEach(x=>x.classList.remove('picked'));
+      t.classList.add('picked'); picked=t.dataset.id;
+      document.getElementById('lockBtn').disabled=false;
+    };
+  });
+  document.getElementById('lockBtn').onclick = async ()=>{
+    const btn = document.getElementById('lockBtn');
+    btn.textContent = 'Submitting commitment...'; btn.disabled = true;
+    try {
+      const moveIndex = cfg.options.findIndex(o=>o.id===picked);
+      const salt = randomFelt();
+      const secret = randomFelt();
+      await submitCommitMove({ provider: account.provider, caseId: round.caseId, moveValue: moveIndex, salt, claimSecret: secret });
+      round.myMove = picked;
+      round.myMoved = true;
+      round.pendingReveal = { moveValue: moveIndex, salt };
+      round.claimSecret = secret;
+      round.stage = 'matched';
       render();
-    });
-  }
+    } catch(err) {
+      logError('commit failed', err);
+      alert('could not submit your move, see console for details');
+      btn.textContent='Lock move'; btn.disabled=false;
+    }
+  };
 }
 
 function renderBluffPlay(el, round){
   if(round.stage==='dealt'){
+    const actionLabel = round.role==='creator' ? 'BET' : 'CALL';
     el.innerHTML = `
       <div class="panel torn enter">
         <div class="panel-title">Your hand</div>
@@ -860,31 +1105,50 @@ function renderBluffPlay(el, round){
         <div class="pot-strip"><span>ANTE</span><b>${round.stake.toFixed(2)} STRK each</b></div>
         <div class="btn-row">
           <button class="btn3 outline" id="foldBtn">FOLD</button>
-          <button class="btn3" id="betBtn">BET</button>
+          <button class="btn3" id="betBtn">${actionLabel}</button>
         </div>
-        <div class="panel-hint">Bet, and your opponent has to decide whether to call without seeing your card. Fold, and you forfeit your ante now.</div>
+        <div class="panel-hint">${round.role==='creator' ? 'Bet, and your opponent has to decide whether to call without seeing your card. Fold, and you forfeit your ante now.' : 'Call to compare cards, or fold and forfeit your ante now.'}</div>
       </div>
     `;
-    document.getElementById('foldBtn').onclick = ()=>{
-      round.betLog.push({who:'you',action:'FOLD'});
-      round.myMoved = true; round.outcomeKind='fold-self';
-      round.stage='result'; recordBluffResult(round); render();
-    };
-    document.getElementById('betBtn').onclick = ()=>{
-      round.betLog.push({who:'you',action:'BET'});
-      round.myMoved = true;
-      round.stage='pending-call'; render();
-      // opponent's call/fold response, kept as a short simulated exchange
-      // instead of its own async window, see design note in the readme
-      setTimeout(()=>{
-        const oppStrength = rankValue(round.oppCard || (round.oppCard=drawCard()));
-        const callChance = 0.35 + (oppStrength/14)*0.5;
-        const calls = Math.random() < callChance;
-        round.betLog.push({who:'them', action: calls?'CALL':'FOLD'});
-        if(calls){ round.stage='showdown'; } else { round.outcomeKind='fold-opp'; round.stage='result'; }
-        recordBluffResult(round);
+    document.getElementById('foldBtn').onclick = async ()=>{
+      const foldBtn = document.getElementById('foldBtn');
+      foldBtn.disabled = true;
+      try {
+        const moveValue = packBluffAction(0, RANKS.indexOf(round.myCard));
+        const salt = randomFelt();
+        const secret = randomFelt();
+        await submitCommitMove({ provider: account.provider, caseId: round.caseId, moveValue, salt, claimSecret: secret });
+        await submitRevealMove({ provider: account.provider, caseId: round.caseId, moveValue, salt });
+        round.claimSecret = secret;
+        round.betLog.push({who:'you',action:'FOLD'});
+        round.myMoved = true; round.myRevealed = true;
+        round.stage = 'resolving';
         render();
-      }, 1500);
+      } catch(err) {
+        logError('bluff fold failed', err);
+        alert('could not submit fold, see console for details');
+        foldBtn.disabled = false;
+      }
+    };
+    document.getElementById('betBtn').onclick = async ()=>{
+      const betBtn = document.getElementById('betBtn');
+      betBtn.disabled = true;
+      try {
+        const moveValue = packBluffAction(1, RANKS.indexOf(round.myCard));
+        const salt = randomFelt();
+        const secret = randomFelt();
+        await submitCommitMove({ provider: account.provider, caseId: round.caseId, moveValue, salt, claimSecret: secret });
+        await submitRevealMove({ provider: account.provider, caseId: round.caseId, moveValue, salt });
+        round.claimSecret = secret;
+        round.betLog.push({who:'you',action: actionLabel});
+        round.myMoved = true; round.myRevealed = true;
+        round.stage = round.role==='creator' ? 'pending-call' : 'resolving';
+        render();
+      } catch(err) {
+        logError('bluff bet/call failed', err);
+        alert('could not submit your action, see console for details');
+        betBtn.disabled = false;
+      }
     };
   }
   else if(round.stage==='pending-call'){
@@ -894,7 +1158,7 @@ function renderBluffPlay(el, round){
         <div class="bet-log">${renderBetLog(round)}</div>
         <div class="pulse-wrap">
           <div class="pulse-dot"></div>
-          <div class="waiting-msg">Opponent is deciding whether to call your bet...</div>
+          <div class="waiting-msg">Waiting for the other player to call or fold on-chain...</div>
         </div>
       </div>
     `;
@@ -906,20 +1170,6 @@ function renderBetLog(round){
   return round.betLog.map(b=>`<div class="${b.who==='them'?'them':''}">${b.who==='them'?'OPPONENT':'YOU'} &rarr; ${b.action}</div>`).join('');
 }
 
-function recordBluffResult(round){
-  if(round.recorded) return;
-  let outcome;
-  if(round.stage==='showdown'){
-    const mine=rankValue(round.myCard), theirs=rankValue(round.oppCard);
-    outcome = mine===theirs?'tie':mine>theirs?'win':'lose';
-  } else if(round.outcomeKind==='fold-opp'){ outcome='win'; }
-  else { outcome='lose'; }
-  round.outcome = outcome;
-  round.recorded = true;
-  const delta = outcome==='win'?round.stake:outcome==='lose'?-round.stake:0;
-  recordResult(round.game, round.stake, outcome, delta);
-}
-
 function renderBluffResult(el, round){
   const outcome = round.outcome;
   let cardsHtml;
@@ -928,7 +1178,12 @@ function renderBluffResult(el, round){
       <div class="party"><div class="who">YOU</div><div class="reveal-glyph">${round.myCard}</div></div>
       <div class="party"><div class="who">OPPONENT</div><div class="redaction"><span class="lockglyph">FOLDED</span></div></div>
     </div>`;
-  } else if(round.outcomeKind==='fold-self'){
+  } else if(round.outcomeKind==='creator-folded'){
+    cardsHtml = `<div class="parties">
+      <div class="party"><div class="who">YOU</div><div class="redaction"><span class="lockglyph">NOT NEEDED</span></div></div>
+      <div class="party"><div class="who">OPPONENT</div><div class="redaction"><span class="lockglyph">FOLDED</span></div></div>
+    </div>`;
+  } else if(round.myMoved && !round.oppCard){
     cardsHtml = `<div class="parties">
       <div class="party"><div class="who">YOU</div><div class="reveal-glyph">${round.myCard}</div></div>
       <div class="party"><div class="who">OPPONENT</div><div class="redaction"><span class="lockglyph">HIDDEN</span></div></div>
@@ -941,7 +1196,6 @@ function renderBluffResult(el, round){
   }
   const stampText = outcome==='win'?'CLEARED':outcome==='tie'?'STALEMATE':'CASE LOST';
   const stampCls = outcome==='win'?'':outcome==='tie'?'tie':'lose';
-  const potLine = outcome==='win'?'&rarr; credited to your shielded balance':outcome==='tie'?'&rarr; both antes refunded':'&rarr; credited to opponent\u2019s shielded balance';
 
   el.innerHTML = `
     <div class="panel torn enter">
@@ -949,13 +1203,11 @@ function renderBluffResult(el, round){
       <div class="bet-log">${renderBetLog(round)}</div>
       ${cardsHtml}
       <div class="stamp-zone"><div class="stamp ${stampCls}" style="animation-delay:480ms;">${stampText}</div></div>
-      <div class="result-line enter" style="animation-delay:750ms;">Pot: <b>${round.pot.toFixed(2)} STRK</b> ${potLine}</div>
-      <button class="btn3 wide enter" id="claimBtn" style="margin-top:16px; animation-delay:820ms;">${outcome==='lose'?'Back to board':'Claim &amp; back to board'}</button>
+      <div class="result-line enter" style="animation-delay:750ms;">Pot: <b>${round.pot.toFixed(2)} STRK</b> \u2014 outcome recorded on-chain</div>
+      <button class="btn3 wide enter" id="backBtn2" style="margin-top:16px; animation-delay:820ms;">Back to board</button>
     </div>
   `;
-  document.getElementById('claimBtn').onclick = ()=>{
-    if(outcome==='lose'){ goToBoard(); } else { resolvePot(()=> goToBoard()); }
-  };
+  document.getElementById('backBtn2').onclick = ()=> goToBoard();
 }
 
 function renderAssassinPlay(el, round){
@@ -988,11 +1240,25 @@ function renderAssassinPlay(el, round){
         lockBtn.disabled = picks.length!==3;
       };
     });
-    lockBtn.onclick = ()=> commitMove(()=>{
-      round.myPicks = picks.slice(); round.myMoved = true;
-      if(round.oppMoved) resolveRound(round); else round.stage='matched';
-      render();
-    });
+    lockBtn.onclick = async ()=>{
+      lockBtn.textContent = 'Submitting commitment...'; lockBtn.disabled = true;
+      try {
+        const moveValue = packTiles(picks[0], picks[1], picks[2]);
+        const salt = randomFelt();
+        const secret = randomFelt();
+        await submitCommitMove({ provider: account.provider, caseId: round.caseId, moveValue, salt, claimSecret: secret });
+        round.myPicks = picks.slice();
+        round.myMoved = true;
+        round.pendingReveal = { moveValue, salt };
+        round.claimSecret = secret;
+        round.stage = 'matched';
+        render();
+      } catch(err) {
+        logError('assassin commit failed', err);
+        alert('could not submit your move, see console for details');
+        lockBtn.textContent='Lock selection'; lockBtn.disabled=false;
+      }
+    };
   }
   else if(round.stage==='result'){ renderAssassinResult(el, round); }
 }
@@ -1001,11 +1267,9 @@ function renderAssassinResult(el, round){
   const assassinPicks = round.myRole==='assassin' ? round.myPicks : round.oppPicks;
   const targetPicks = round.myRole==='target' ? round.myPicks : round.oppPicks;
   const overlap = assassinPicks.filter(t=>targetPicks.includes(t));
-  const tier = round.tier;
   const outcome = round.outcome;
-  const stampText = tier==='escape'?'ESCAPED':tier==='graze'?'GRAZED':'CAUGHT';
+  const stampText = outcome==='win' ? 'ESCAPED' : 'CAUGHT';
   const stampCls = outcome==='win'?'':outcome==='lose'?'lose':'tie';
-  const myPayout = (round.stake*2*round.myShare).toFixed(2);
 
   let markedCount=0;
   el.innerHTML = `
@@ -1029,38 +1293,37 @@ function renderAssassinResult(el, round){
       <div class="stamp-zone"><div class="stamp ${stampCls}" style="animation-delay:520ms;">${stampText}</div></div>
       <div class="result-line enter" style="animation-delay:780ms;">
         You were the ${round.myRole.toUpperCase()} \u2014 ${overlap.length} overlapping tile${overlap.length===1?'':'s'}<br>
-        Your share: <b>${myPayout} STRK</b> of a ${(round.stake*2).toFixed(2)} STRK pot
+        Outcome recorded on-chain.
       </div>
-      <button class="btn3 wide enter" id="claimBtn" style="margin-top:16px; animation-delay:850ms;">${round.myShare===0?'Back to board':'Claim &amp; back to board'}</button>
+      <button class="btn3 wide enter" id="backBtn2" style="margin-top:16px; animation-delay:850ms;">Back to board</button>
     </div>
   `;
-  document.getElementById('claimBtn').onclick = ()=>{
-    if(round.myShare===0){ goToBoard(); } else { resolvePot(()=> goToBoard()); }
-  };
+  document.getElementById('backBtn2').onclick = ()=> goToBoard();
 }
 
-function createCaseNow(){
+async function createCaseNow(){
   const btn = document.getElementById('createBtn');
-  btn.textContent = 'Posting...';
+  btn.textContent = 'Waiting for wallet approval...';
   btn.disabled = true;
-  setTimeout(()=>{ // stubbed, swap for the real stake call once the contract's deployed
-    const d = state.draft;
-    const joinMs = d.customOn ? d.customVal*(d.customUnit==='hours'?3600000:60000) : d.joinMs;
-    const round = newRound({ game: state.game, stake: d.stake, role:'creator', joinMs });
-    CASES[state.game].push({ slug: round.slug, stake: round.stake });
-    scheduleMockOpponent(round);
+  const d = state.draft;
+  const joinSecs = d.customOn ? Math.round(d.customVal*(d.customUnit==='hours'?3600:60)) : Math.round(d.joinMs/1000);
+  try {
+    const { caseId } = await submitCreateCase({
+      provider: account.provider,
+      gameKey: state.game,
+      stakeDecimal: d.stake,
+      joinWindowSecs: joinSecs,
+    });
+    const round = newRound({ game: state.game, stake: d.stake, role:'creator', joinMs: joinSecs*1000, caseId });
+    startCasePolling(round);
     openRound(round.slug);
-  }, 700);
-}
-function commitMove(done){
-  const btn = document.getElementById('lockBtn');
-  if(btn){ btn.textContent='Submitting commitment...'; btn.disabled=true; }
-  setTimeout(done, 700); // stubbed, swap for the real reveal-adjacent call later
-}
-function resolvePot(done){
-  const btn = document.getElementById('claimBtn');
-  if(btn){ btn.textContent='Claiming into shielded balance...'; btn.disabled=true; }
-  setTimeout(done, 700); // stubbed, swap for the real claim call once the contract's deployed
+  } catch(err) {
+    logError('create case failed', err);
+    alert('could not create the case, see console for details');
+  } finally {
+    btn.textContent = 'Post case';
+    btn.disabled = false;
+  }
 }
 
 document.getElementById('myCasesTrigger').onclick = openMyCases;
@@ -1069,4 +1332,5 @@ document.getElementById('profileOverlay').addEventListener('click', (e)=>{ if(e.
 document.getElementById('myCasesOverlay').addEventListener('click', (e)=>{ if(e.target.id==='myCasesOverlay') closeMyCases(); });
 document.addEventListener('keydown', (e)=>{ if(e.key==='Escape'){ closeProfile(); closeMyCases(); } });
 
+log('HIDDEN app loaded, contract:', CONTRACT_ADDRESS);
 render();
