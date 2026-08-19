@@ -267,41 +267,17 @@ async function queryPublicStrkBalance(address){
 
 async function fetchOpenCases(gameKey){
   const gameIndex = GAME_TYPE_INDEX[gameKey];
-  const candidates = [];
-  let continuationToken = undefined;
-  let guard = 0;
-
-  do {
-    const resp = await sepoliaRpc.getEvents({
-      address: CONTRACT_ADDRESS,
-      from_block: { block_number: 0 },
-      to_block: 'latest',
-      keys: [[CASE_CREATED_SELECTOR]],
-      chunk_size: 50,
-      continuation_token: continuationToken,
-    });
-    log('fetchOpenCases: event page', resp);
-    for(const ev of (resp.events||[])){
-      const caseId = feltToBigInt(ev.keys[1]);
-      const data = (ev.data||[]).map(feltToBigInt);
-      const evGameType = Number(data[1]);
-      const stakeAmount = data[2];
-      const joinDeadline = Number(data[3]);
-      if(evGameType !== gameIndex) continue;
-      candidates.push({ caseId, stakeAmount, joinDeadline });
-    }
-    continuationToken = resp.continuation_token;
-    guard++;
-  } while(continuationToken && guard < 20);
-
   const now = Math.floor(Date.now()/1000);
   const open = [];
-  for(const c of candidates){
-    if(c.joinDeadline <= now) continue;
-    try {
-      const entry = await readCase(c.caseId);
-      if(entry.opponent === 0n) open.push({ caseId: c.caseId, stakeDecimal: Number(c.stakeAmount)/1e18 });
-    } catch(err) { log('fetchOpenCases: could not read case', c.caseId, err); }
+  const MAX_PROBE = 200; // safety cap, plenty above expected case volume
+  for(let id = 1; id <= MAX_PROBE; id++){
+    let entry;
+    try { entry = await readCase(BigInt(id)); }
+    catch(err){ log('fetchOpenCases: stopped probing at case', id, err); break; }
+    if(entry.creator === 0n) break; // past the last real case, stop here
+    if(entry.gameType === gameIndex && entry.opponent === 0n && entry.joinDeadline > now){
+      open.push({ caseId: BigInt(id), stakeDecimal: Number(entry.stakeAmount)/1e18 });
+    }
   }
   log('fetchOpenCases: open cases for', gameKey, open);
   return open;
@@ -975,8 +951,8 @@ function renderSharePanel(el, round){
     </div>
   `;
   document.getElementById('shareBtn').onclick = async (e)=>{
-    if(navigator.share){ try{ await navigator.share({ url:'https://'+caseLink(round.caseId), title:'HIDDEN', text:`Join my ${GAMES[round.game].name} case on HIDDEN, case #${round.caseId}` }); }catch(err){} }
-    else { navigator.clipboard?.writeText(caseLink(round.caseId)).catch(()=>{}); e.target.textContent='Copied'; setTimeout(()=>{e.target.textContent='Share link';},1400); }
+  if(navigator.share){ try{ await navigator.share({ url: caseLink(round.caseId), title:'HIDDEN', text:`Join my ${GAMES[round.game].name} case on HIDDEN, case #${round.caseId}` }); }catch(err){} }
+  else { navigator.clipboard?.writeText(caseLink(round.caseId)).catch(()=>{}); e.target.textContent='Copied'; setTimeout(()=>{e.target.textContent='Share link';},1400); }
   };
   document.getElementById('waitBtn').onclick = ()=>{ round.stage='waiting'; render(); };
 }
@@ -1341,10 +1317,21 @@ document.getElementById('profileOverlay').addEventListener('click', (e)=>{ if(e.
 document.getElementById('myCasesOverlay').addEventListener('click', (e)=>{ if(e.target.id==='myCasesOverlay') closeMyCases(); });
 document.addEventListener('keydown', (e)=>{ if(e.key==='Escape'){ closeProfile(); closeMyCases(); } });
 
-function checkUrlForCase(){
+async function checkUrlForCase(){
   const params = new URLSearchParams(window.location.search);
-  const caseId = params.get('case');
-  if(caseId) joinCaseById(caseId);
+  const caseIdRaw = params.get('case');
+  if(!caseIdRaw) return;
+  try {
+    const entry = await readCase(BigInt(caseIdRaw));
+    const gameKey = Object.keys(GAME_TYPE_INDEX).find(k => GAME_TYPE_INDEX[k] === entry.gameType);
+    if(gameKey) state.game = gameKey;
+    state.view = 'board';
+    render();
+    const input = document.getElementById('joinCaseIdInput');
+    if(input) input.value = caseIdRaw;
+  } catch(err) {
+    log('checkUrlForCase: could not preload case from URL', err);
+  }
 }
 
 log('HIDDEN app loaded, contract:', CONTRACT_ADDRESS);
