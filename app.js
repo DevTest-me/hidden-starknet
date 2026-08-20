@@ -1,5 +1,12 @@
 import { connect } from "get-starknet";
-import { WalletAccountV6, RpcProvider, hash, shortString } from "starknet";
+import { WalletAccountV6, RpcProvider, hash, shortString, ec, constants } from "starknet";
+import {
+  bytesToHexString,
+  createSession,
+  createSessionRequest,
+  buildSessionAccount,
+} from "@argent/x-sessions";
+import { requestSessionAccount } from "starknet-sessions";
 
 // Main workflow (create/join/commit/reveal/resolve) is wired to the real
 // deployed Sepolia contract. privacy_invoke (Deposit/Claim) is still a
@@ -139,6 +146,90 @@ async function sendInvoke(provider, calls){
   return txHash;
 }
 
+const SESSION_METHODS = [
+  { contractAddress: CONTRACT_ADDRESS, entrypoint: 'commit_move' },
+  { contractAddress: CONTRACT_ADDRESS, entrypoint: 'reveal_move' },
+];
+
+function sessionExpiry(){
+  return new Date(Date.now() + MOVE_WINDOW_MS * 2);
+}
+
+async function createArgentSession(provider, address){
+  const sessionKeyBytes = ec.starkCurve.utils.randomPrivateKey();
+  const sessionKey = {
+    privateKey: bytesToHexString(sessionKeyBytes),
+    publicKey: ec.starkCurve.getStarkKey(sessionKeyBytes),
+  };
+  const sessionParams = {
+    sessionKey,
+    allowedMethods: SESSION_METHODS.map(({ contractAddress, entrypoint }) => ({
+      'Contract Address': contractAddress,
+      selector: entrypoint,
+    })),
+    expiry: BigInt(Math.floor(sessionExpiry().getTime() / 1000)),
+    metaData: {
+      projectID: 'hidden',
+      txFees: [{ tokenAddress: SEPOLIA_STRK_ADDRESS, maxAmount: '100000000000000000' }],
+    },
+  };
+  const sessionRequest = createSessionRequest({
+    chainId: constants.StarknetChainId.SN_SEPOLIA,
+    sessionParams,
+  });
+  const request = walletApiRequest(provider);
+  if(!request) throw new Error('wallet provider cannot sign an Argent session');
+  const authorisationSignature = await request({
+    type: 'wallet_signTypedData',
+    params: sessionRequest.sessionTypedData,
+  });
+  const session = await createSession({
+    sessionRequest,
+    address,
+    chainId: constants.StarknetChainId.SN_SEPOLIA,
+    authorisationSignature,
+  });
+  log('createArgentSession: session object', session);
+  return buildSessionAccount({
+    useCacheAuthorisation: false,
+    session,
+    sessionKey,
+    provider: sepoliaRpc,
+  });
+}
+
+async function createBraavosSession(provider, address){
+  const walletAccount = new WalletAccountV6({
+    provider: sepoliaRpc,
+    walletProvider: provider,
+    address,
+  });
+  return requestSessionAccount(sepoliaRpc, walletAccount, {
+    executeAfter: new Date(),
+    executeBefore: sessionExpiry(),
+    requestedMethods: SESSION_METHODS,
+    spendingLimits: [],
+    strkGasLimit: 10_000_000_000_000_000n,
+  });
+}
+
+async function createSessionAccount(walletId, provider, address){
+  if(walletId === 'argentX') return createArgentSession(provider, address);
+  if(walletId === 'braavos') return createBraavosSession(provider, address);
+  return null;
+}
+
+async function sendSessionInvoke(sessionAccount, calls){
+  const result = await sessionAccount.execute(calls.map(call => ({
+    contractAddress: call.contract_address,
+    entrypoint: call.entry_point,
+    calldata: call.calldata,
+  })));
+  const txHash = result?.transaction_hash ?? result?.transactionHash ?? result;
+  if(!txHash) throw new Error('session account did not return a transaction hash');
+  return txHash;
+}
+
 async function waitForReceipt(txHash){
   log('waitForReceipt: waiting on', txHash);
   for(let i=0;i<40;i++){
@@ -207,20 +298,26 @@ async function submitCommitMove({ provider, caseId, moveValue, salt, claimSecret
   const commitHash = computeMoveHash(moveValue, salt);
   const claimHash = computeClaimHash(claimSecret);
   log('submitCommitMove', { caseId, moveValue, commitHash, claimHash });
-  const txHash = await sendInvoke(provider, [{
+  const calls = [{
     contract_address: CONTRACT_ADDRESS, entry_point: 'commit_move',
     calldata: [String(caseId), commitHash.toString(), claimHash.toString()],
-  }]);
+  }];
+  const txHash = account?.sessionAccount
+    ? await sendSessionInvoke(account.sessionAccount, calls)
+    : await sendInvoke(provider, calls);
   await waitForReceipt(txHash);
   return { txHash, commitHash, claimHash };
 }
 
 async function submitRevealMove({ provider, caseId, moveValue, salt }){
   log('submitRevealMove', { caseId, moveValue });
-  const txHash = await sendInvoke(provider, [{
+  const calls = [{
     contract_address: CONTRACT_ADDRESS, entry_point: 'reveal_move',
     calldata: [String(caseId), String(moveValue), salt.toString()],
-  }]);
+  }];
+  const txHash = account?.sessionAccount
+    ? await sendSessionInvoke(account.sessionAccount, calls)
+    : await sendInvoke(provider, calls);
   await waitForReceipt(txHash);
   return txHash;
 }
@@ -303,10 +400,76 @@ function newRound({game, stake, role, joinMs, caseId}){
     myCard:null, oppCard:null, pot:stake*2, betLog:[], outcomeKind:null,
     myRole:null, myPicks:[], oppPicks:[],
     outcome:null, recorded:false,
-    pendingReveal:null, claimSecret:null, pollTimer:null,
+    pendingReveal:null, claimSecret:null, pollTimer:null, resolvePending:false,
   };
   MY_ROUNDS[slug] = round;
   return round;
+}
+
+function normalizeAddress(value){
+  try { return BigInt(value).toString(16).toLowerCase(); }
+  catch { return String(value ?? '').replace(/^0x/i, '').replace(/^0+/, '').toLowerCase() || '0'; }
+}
+
+async function rehydrateMyRounds(address){
+  const walletAddress = normalizeAddress(address);
+  const gameByIndex = Object.fromEntries(Object.entries(GAME_TYPE_INDEX).map(([key, index]) => [index, key]));
+  const MAX_PROBE = 200;
+
+  for(let id = 1; id <= MAX_PROBE; id++){
+    let entry;
+    try { entry = await readCase(BigInt(id)); }
+    catch(err){ logError('rehydrateMyRounds: stopped probing at case', id, err); break; }
+    if(entry.creator === 0n) break;
+
+    const creator = normalizeAddress(entry.creator);
+    const opponent = normalizeAddress(entry.opponent);
+    const isCreator = creator === walletAddress;
+    const isOpponent = opponent === walletAddress;
+    if(!isCreator && !isOpponent) continue;
+    if(Object.values(MY_ROUNDS).some(round => BigInt(round.caseId) === BigInt(id))) continue;
+
+    const role = isCreator ? 'creator' : 'joiner';
+    if(!isCreator && entry.opponent === 0n) continue;
+    const game = gameByIndex[entry.gameType];
+    if(!game) { log('rehydrateMyRounds: unknown game type for case', id, entry.gameType); continue; }
+    const joinMs = Math.max(0, entry.joinDeadline * 1000 - Date.now());
+    const round = newRound({
+      game,
+      stake: Number(entry.stakeAmount) / 1e18,
+      role,
+      joinMs,
+      caseId: BigInt(id),
+    });
+    round.joinDeadline = entry.joinDeadline * 1000;
+
+    if(entry.opponent === 0n){
+      round.stage = 'share';
+      startCasePolling(round);
+      continue;
+    }
+
+    round.stage = 'matched';
+    round.filledAt = entry.joinDeadline * 1000;
+    round.moveDeadline = entry.moveDeadline * 1000;
+    const iAmA = role === 'creator';
+    round.myMoved = iAmA ? entry.hasCommittedA : entry.hasCommittedB;
+    round.oppMoved = iAmA ? entry.hasCommittedB : entry.hasCommittedA;
+    round.myRevealed = iAmA ? entry.hasRevealedA : entry.hasRevealedB;
+    round.oppRevealed = iAmA ? entry.hasRevealedB : entry.hasRevealedA;
+
+    if(game === 'assassin'){
+      round.myRole = entry.assassinIsA === iAmA ? 'assassin' : 'target';
+    }
+
+    if(entry.outcome !== 0){
+      applyRevealedMoves(round, entry);
+      finalizeFromChain(round, entry);
+    } else {
+      startCasePolling(round);
+    }
+  }
+  log('rehydrateMyRounds: rebuilt rounds', Object.values(MY_ROUNDS).length);
 }
 
 function startCasePolling(round){
@@ -327,22 +490,31 @@ function outcomeFromChain(entry, iAmA){
 
 function applyRevealedMoves(round, entry){
   const iAmA = round.role==='creator';
+  const myValue = iAmA ? entry.revealedMoveA : entry.revealedMoveB;
   const oppValue = iAmA ? entry.revealedMoveB : entry.revealedMoveA;
+  const myRevealed = iAmA ? entry.hasRevealedA : entry.hasRevealedB;
+  const oppRevealed = iAmA ? entry.hasRevealedB : entry.hasRevealedA;
 
   if(round.game==='rps' || round.game==='pd'){
     const opts = SIMUL_CONFIG[round.game].options;
-    const idx = Number(oppValue);
-    if(opts[idx]) round.oppMove = opts[idx].id;
+    const myOpt = opts[Number(myValue)];
+    const oppOpt = opts[Number(oppValue)];
+    if(myOpt) round.myMove = myOpt.id;
+    if(oppOpt) round.oppMove = oppOpt.id;
   } else if(round.game==='assassin'){
-    const v = Number(oppValue);
-    round.oppPicks = [v % 16, Math.floor(v/16) % 16, Math.floor(v/256) % 16];
+    const mv = Number(myValue), ov = Number(oppValue);
+    round.myPicks = [mv % 16, Math.floor(mv/16) % 16, Math.floor(mv/256) % 16];
+    round.oppPicks = [ov % 16, Math.floor(ov/16) % 16, Math.floor(ov/256) % 16];
   } else if(round.game==='bluff'){
-    const v = Number(oppValue);
-    const action = v % 2;
-    const cardIdx = Math.floor(v/2);
-    round.oppCard = RANKS[cardIdx];
-    if(round.role==='creator') round.outcomeKind = action===0 ? 'fold-opp' : null;
-    else round.outcomeKind = action===0 ? 'creator-folded' : null;
+    // opponent may never have actually revealed at all, if I'm the
+    // creator and I folded immediately, don't decode a value that was
+    // never really set
+    if(myRevealed && !round.myCard) round.myCard = RANKS[Math.floor(Number(myValue)/2)];
+    if(oppRevealed){
+      round.oppCard = RANKS[Math.floor(Number(oppValue)/2)];
+      const oppAction = Number(oppValue) % 2;
+      round.outcomeKind = oppAction===0 ? 'fold-opp' : null;
+    }
   }
 }
 
@@ -386,9 +558,19 @@ async function applyChainState(round, entry){
   }
 
   const bothRevealed = entry.hasRevealedA && entry.hasRevealedB;
-  if(entry.outcome === 0 && bothRevealed){
+  const deadlinePassed = round.moveDeadline && Date.now() >= round.moveDeadline;
+  if(entry.outcome === 0 && (bothRevealed || deadlinePassed) && !round.resolvePending){
+    round.resolvePending = true;
     try { await submitResolve({ provider: account.provider, caseId: round.caseId }); }
-    catch(err){ log('resolve call failed, will retry on next poll', err); }
+    catch(err){
+     const msg = String(err?.message ?? '').toUpperCase();
+     if(msg.includes('ALREADY_RESOLVED')){
+       log('submitResolve: the other player already resolved it, that\'s fine');
+      } else {
+        log('resolve call failed, will retry on next poll', err);
+        round.resolvePending = false;
+      }
+    }
   }
 
   if(entry.outcome !== 0){
@@ -421,9 +603,9 @@ function expireRound(round){ round.stage = 'expired'; }
 setInterval(()=>{
   let needsRender = false;
   Object.values(MY_ROUNDS).forEach(round=>{
-    if(round.stage==='waiting' && Date.now()>=round.joinDeadline){
+    if((round.stage==='waiting' || round.stage==='share') && Date.now()>=round.joinDeadline){
       expireRound(round);
-      if(state.activeSlug===round.slug) needsRender = true;
+     if(state.activeSlug===round.slug) needsRender = true;
     } else if(round.stage==='matched' && round.moveDeadline && Date.now()>=round.moveDeadline){
       resolveOnTimeout(round);
       if(state.activeSlug===round.slug) needsRender = true;
@@ -463,6 +645,7 @@ let state = {
   game:'rps',
   view:'board',
   activeSlug:null,
+  pendingJoinCaseId: null,
   draft:{ stake:1, joinMs:JOIN_PRESETS[1].ms, customOn:false, customVal:1, customUnit:'hours' },
 };
 
@@ -563,8 +746,18 @@ async function connectAccount(){
     let publicBalance = null;
     try { publicBalance = await queryPublicStrkBalance(address); }
     catch (balanceErr) { logError('could not read public Sepolia STRK balance', balanceErr); }
-    log('connectAccount: connected', { address, publicBalance });
-    return { address, provider, publicBalance };
+    let sessionAccount = null;
+    try {
+      sessionAccount = await createSessionAccount(wallets[0].id, provider, address);
+      if(sessionAccount) log('connectAccount: session account ready', wallets[0].name);
+    } catch(err) {
+      logError('connectAccount: session setup failed, continuing without session key', err);
+      if(account) account.sessionAccount = null;
+    }
+    try { await rehydrateMyRounds(address); }
+    catch(err) { logError('connectAccount: failed to rehydrate My Cases', err); }
+    log('connectAccount: connected', { address, publicBalance, sessionAccount:!!sessionAccount });
+    return { address, provider, publicBalance, sessionAccount };
   } catch (err) {
     logError('connectAccount failed', err);
     alert('could not connect, make sure your wallet is unlocked and try again');
@@ -772,18 +965,26 @@ function renderTabs(){
 
 // Real shared board, built from CaseCreated events across all wallets.
 function renderBoard(el){
+  const pending = state.pendingJoinCaseId;
   el.innerHTML = `
     <div class="section-label">open cases \u2014 ${GAMES[state.game].name}</div>
+    ${pending ? `
+      <div class="panel torn enter" style="margin-bottom:20px;">
+        <div class="panel-title">You were sent a case</div>
+        <div class="panel-hint">Case #${pending} is waiting for you.</div>
+        <button class="btn3 wide" id="joinPendingBtn" style="margin-top:12px;">Join case #${pending}</button>
+      </div>
+    ` : ''}
     <div class="panel-hint" id="boardStatus" style="margin-bottom:16px;">Loading open cases from the chain...</div>
     <div class="board" id="boardGrid"></div>
-    <div class="section-label" style="margin-top:24px;">Have a specific case ID?</div>
-    <div class="stake-input-row">
-      <input type="text" id="joinCaseIdInput" placeholder="case id">
-    </div>
-    <button class="btn3 wide" id="joinByIdBtn" style="margin-top:10px;">Join by ID</button>
-  `;
-  document.getElementById('joinByIdBtn').onclick = ()=> joinCaseById(document.getElementById('joinCaseIdInput').value.trim());
+      `;
   loadBoard();
+  if(pending){
+    document.getElementById('joinPendingBtn').onclick = ()=>{
+      state.pendingJoinCaseId = null; // clear immediately, this button only fires once
+      joinCaseById(pending);
+    };
+  }
 }
 
 async function loadBoard(){
@@ -810,7 +1011,12 @@ async function loadBoard(){
         <div class="lbl">POST NEW CASE</div>
       </div>
     `;
-    grid.querySelectorAll('[data-case]').forEach(b=>{ b.onclick = ()=> joinCaseById(b.dataset.case); });
+    grid.querySelectorAll('[data-case]').forEach(b=>{
+  b.onclick = ()=>{
+    b.textContent = 'Joining...'; b.disabled = true;
+    joinCaseById(b.dataset.case).finally(()=>{ b.textContent='Join'; b.disabled=false; });
+  };
+});
     document.getElementById('createCard').onclick = goToCreate;
   } catch(err) {
     logError('loadBoard failed', err);
@@ -818,8 +1024,13 @@ async function loadBoard(){
   }
 }
 
+let joinInFlight = null;
+
 async function joinCaseById(caseIdRaw){
   if(!caseIdRaw) return;
+  const key = String(caseIdRaw);
+  if(joinInFlight === key) return;
+  joinInFlight = key;
   if(!account){
     account = await connectAccount();
     if(!account) return;
@@ -841,7 +1052,7 @@ async function joinCaseById(caseIdRaw){
     logError('joinCaseById failed', err);
     alert('could not join that case, double check the ID and try again');
   } finally {
-    if(btn){ btn.textContent='Join by ID'; btn.disabled=false; }
+    joinInFlight = null;
   }
 }
 
@@ -1002,12 +1213,25 @@ function renderMatchedPanel(el, round){
       <div class="status-row"><span class="status-dot pending"></span>Waiting on opponent</div>
       <div class="status-banner">Round resolves the moment they move, or in <span class="countdown" id="moveCountdown">${formatCountdown(round.moveDeadline-Date.now())}</span> if they don't.</div>
     `;
-  } else {
+    } else if(round.myMoved && round.oppMoved){
+    statusHtml = `
+      <div class="status-row"><span class="status-dot"></span>Both sides locked in</div>
+      <div class="pulse-wrap" style="padding:20px 0 6px;">
+        <div class="pulse-dot"></div>
+        <div class="waiting-msg">Finalizing on-chain \u2014 this can take a few seconds.</div>
+      </div>
+    `;
+    } else if(round.game==='bluff' && round.role==='creator'){
     statusHtml = `
       <div class="status-row"><span class="status-dot"></span>Opponent connected</div>
-      <div class="panel-hint">You don't have to move right now \u2014 come back anytime via My Cases. But if your opponent moves first, you'll only have until <span class="countdown" id="moveCountdown">${formatCountdown(round.moveDeadline-Date.now())}</span> from now to respond before you forfeit.</div>
+      <div class="panel-hint">Bluff needs you to act first \u2014 bet or fold \u2014 before your opponent can respond. Come back anytime, they're waiting on you.</div>
     `;
-  }
+    } else {
+       statusHtml = `
+        <div class="status-row"><span class="status-dot"></span>Opponent connected</div>
+        <div class="panel-hint">You don't have to move right now \u2014 come back anytime via My Cases. But if your opponent moves first, you'll only have until <span class="countdown" id="moveCountdown">${formatCountdown(round.moveDeadline-Date.now())}</span> from now to respond before you forfeit.</div>
+      `;
+    }
 
   el.innerHTML = `
     <div class="panel torn enter">
@@ -1030,6 +1254,7 @@ function renderMatchedPanel(el, round){
 }
 
 function renderSimulPlay(el, round){
+  if(round.stage==='result'){ renderSimulResult(el, round); return; }
   const cfg = SIMUL_CONFIG[round.game];
   if(round.stage!=='choose') return;
 
@@ -1075,6 +1300,37 @@ function renderSimulPlay(el, round){
       btn.textContent='Lock move'; btn.disabled=false;
     }
   };
+}
+
+function renderSimulResult(el, round){
+  const cfg = SIMUL_CONFIG[round.game];
+  const myOpt = cfg.options.find(o=>o.id===round.myMove);
+  const oppOpt = cfg.options.find(o=>o.id===round.oppMove);
+  const outcome = round.outcome;
+  const stampText = outcome==='win' ? 'CLEARED' : outcome==='tie' ? 'STALEMATE' : 'CASE LOST';
+  const stampCls = outcome==='win' ? '' : outcome==='tie' ? 'tie' : 'lose';
+
+  el.innerHTML = `
+    <div class="panel torn enter">
+      <div class="panel-title">Reveal</div>
+      <div class="parties">
+        <div class="party">
+          <div class="who">YOU</div>
+          <div class="reveal-glyph">${myOpt ? iconSpan(myOpt.icon,40) : '?'}</div>
+          <div class="card-caption">${myOpt ? myOpt.label : '\u2014'}</div>
+        </div>
+        <div class="party">
+          <div class="who">OPPONENT</div>
+          <div class="reveal-glyph" style="animation-delay:150ms;">${oppOpt ? iconSpan(oppOpt.icon,40) : '?'}</div>
+          <div class="card-caption">${oppOpt ? oppOpt.label : '\u2014'}</div>
+        </div>
+      </div>
+      <div class="stamp-zone"><div class="stamp ${stampCls}" style="animation-delay:480ms;">${stampText}</div></div>
+      <div class="result-line enter" style="animation-delay:750ms;">Pot: <b>${round.pot.toFixed(2)} STRK</b> \u2014 outcome recorded on-chain</div>
+      <button class="btn3 wide enter" id="backBtn2" style="margin-top:16px; animation-delay:820ms;">Back to board</button>
+    </div>
+  `;
+  document.getElementById('backBtn2').onclick = ()=> goToBoard();
 }
 
 function renderBluffPlay(el, round){
@@ -1326,9 +1582,8 @@ async function checkUrlForCase(){
     const gameKey = Object.keys(GAME_TYPE_INDEX).find(k => GAME_TYPE_INDEX[k] === entry.gameType);
     if(gameKey) state.game = gameKey;
     state.view = 'board';
+    state.pendingJoinCaseId = caseIdRaw;
     render();
-    const input = document.getElementById('joinCaseIdInput');
-    if(input) input.value = caseIdRaw;
   } catch(err) {
     log('checkUrlForCase: could not preload case from URL', err);
   }
