@@ -93,7 +93,7 @@ const JOIN_PRESETS = [
   {label:'24 hours', ms:24*60*60*1000},
 ];
 const MOVE_WINDOW_MS = 4*60*60*1000;
-const CONTRACT_ADDRESS = '0x028ac1fac46e7334fe1bf40bb4011072366e52c8553d4b87c059faa5de3daf92';
+const CONTRACT_ADDRESS = '0x01dcf8006f92cd5153bc8339a521d2e2b99abc222e07e579a6ed27e139ef49fd';
 const SEPOLIA_STRK_ADDRESS = '0x04718f5a0fc34cc1af16a1cdee98ffb20c31f5cd61d6ab07201858f4287c938d';
 const SEPOLIA_RPC_URL = `https://starknet-sepolia.g.alchemy.com/starknet/version/rpc/v0_8/${import.meta.env.VITE_ALCHEMY_KEY}`;
 
@@ -107,10 +107,11 @@ const STRK_DECIMALS_FACTOR = 10n ** 18n;
 
 const MOVE_TAG_FELT = shortString.encodeShortString('HIDDEN_MOVE_TAG:V1');
 const CLAIM_TAG_FELT = shortString.encodeShortString('HIDDEN_CLAIM_TAG:V1');
+const ACTION_TAG_FELT = shortString.encodeShortString('HIDDEN_ACTION_TAG:V1');
+const CARD_TAG_FELT = shortString.encodeShortString('HIDDEN_CARD_TAG:V1');
 const CASE_CREATED_SELECTOR = hash.getSelectorFromName('CaseCreated');
 
 function packTiles(t1, t2, t3){ return BigInt(t1) + BigInt(t2)*16n + BigInt(t3)*256n; }
-function packBluffAction(action, cardIndex){ return BigInt(action) + BigInt(cardIndex)*2n; }
 
 function randomFelt(){
   const bytes = new Uint8Array(31);
@@ -120,11 +121,40 @@ function randomFelt(){
   return BigInt(hexStr);
 }
 
+// Reveal material (moveValue + salt) only ever exists client-side —
+// the chain never sees it until reveal. If a commit tx's RPC response
+// is flaky (throws even though the tx landed) or the tab reloads
+// before auto-reveal fires, losing this in memory permanently stalls
+// the case for both players. Save it before sending anything.
+function revealStorageKey(caseId, address){
+  return `hidden_reveal_${normalizeAddress(address)}_${caseId}`;
+}
+function savePendingReveal(caseId, address, data){
+  try { localStorage.setItem(revealStorageKey(caseId, address), JSON.stringify(data)); }
+  catch(err){ logError('savePendingReveal failed', err); }
+}
+function loadPendingReveal(caseId, address){
+  try {
+    const raw = localStorage.getItem(revealStorageKey(caseId, address));
+    return raw ? JSON.parse(raw) : null;
+  } catch(err){ logError('loadPendingReveal failed', err); return null; }
+}
+function clearPendingReveal(caseId, address){
+  try { localStorage.removeItem(revealStorageKey(caseId, address)); }
+  catch(err){ logError('clearPendingReveal failed', err); }
+}
+
 function computeMoveHash(moveValue, salt){
   return hash.computePoseidonHashOnElements([MOVE_TAG_FELT, BigInt(moveValue), salt]);
 }
 function computeClaimHash(secret){
   return hash.computePoseidonHashOnElements([CLAIM_TAG_FELT, secret]);
+}
+function computeActionHash(action, salt){
+  return hash.computePoseidonHashOnElements([ACTION_TAG_FELT, BigInt(action), salt]);
+}
+function computeCardHash(cardIndex, salt){
+  return hash.computePoseidonHashOnElements([CARD_TAG_FELT, BigInt(cardIndex), salt]);
 }
 
 function toStakeFelt(stakeDecimal){
@@ -257,6 +287,9 @@ async function readCase(caseId){
     commitHashA: next(), commitHashB: next(), revealedMoveA: next(), revealedMoveB: next(),
     hasCommittedA: feltToBool(next()), hasCommittedB: feltToBool(next()),
     hasRevealedA: feltToBool(next()), hasRevealedB: feltToBool(next()),
+    cardCommitA: next(), cardCommitB: next(),
+    revealedCardA: next(), revealedCardB: next(),
+    hasRevealedCardA: feltToBool(next()), hasRevealedCardB: feltToBool(next()),
     claimHashA: next(), claimHashB: next(),
     fundedA: feltToBool(next()), fundedB: feltToBool(next()),
     outcome: Number(next()), claimedA: feltToBool(next()), claimedB: feltToBool(next()),
@@ -294,13 +327,12 @@ async function submitJoinCase({ provider, caseId }){
   // MAINNET POOL: bundle the opponent's Deposit here too, once live.
 }
 
-async function submitCommitMove({ provider, caseId, moveValue, salt, claimSecret }){
-  const commitHash = computeMoveHash(moveValue, salt);
+async function submitCommitMove({ provider, caseId, commitHash, cardCommit = 0n, claimSecret }){
   const claimHash = computeClaimHash(claimSecret);
-  log('submitCommitMove', { caseId, moveValue, commitHash, claimHash });
+  log('submitCommitMove', { caseId, commitHash, cardCommit, claimHash });
   const calls = [{
     contract_address: CONTRACT_ADDRESS, entry_point: 'commit_move',
-    calldata: [String(caseId), commitHash.toString(), claimHash.toString()],
+    calldata: [String(caseId), commitHash.toString(), cardCommit.toString(), claimHash.toString()],
   }];
   const txHash = account?.sessionAccount
     ? await sendSessionInvoke(account.sessionAccount, calls)
@@ -314,6 +346,32 @@ async function submitRevealMove({ provider, caseId, moveValue, salt }){
   const calls = [{
     contract_address: CONTRACT_ADDRESS, entry_point: 'reveal_move',
     calldata: [String(caseId), String(moveValue), salt.toString()],
+  }];
+  const txHash = account?.sessionAccount
+    ? await sendSessionInvoke(account.sessionAccount, calls)
+    : await sendInvoke(provider, calls);
+  await waitForReceipt(txHash);
+  return txHash;
+}
+
+async function submitRevealAction({ provider, caseId, action, salt }){
+  log('submitRevealAction', { caseId, action });
+  const calls = [{
+    contract_address: CONTRACT_ADDRESS, entry_point: 'reveal_action',
+    calldata: [String(caseId), String(action), salt.toString()],
+  }];
+  const txHash = account?.sessionAccount
+    ? await sendSessionInvoke(account.sessionAccount, calls)
+    : await sendInvoke(provider, calls);
+  await waitForReceipt(txHash);
+  return txHash;
+}
+
+async function submitRevealCard({ provider, caseId, cardIndex, salt }){
+  log('submitRevealCard', { caseId, cardIndex });
+  const calls = [{
+    contract_address: CONTRACT_ADDRESS, entry_point: 'reveal_card',
+    calldata: [String(caseId), String(cardIndex), salt.toString()],
   }];
   const txHash = account?.sessionAccount
     ? await sendSessionInvoke(account.sessionAccount, calls)
@@ -458,6 +516,14 @@ async function rehydrateMyRounds(address){
     round.myRevealed = iAmA ? entry.hasRevealedA : entry.hasRevealedB;
     round.oppRevealed = iAmA ? entry.hasRevealedB : entry.hasRevealedA;
 
+    if(entry.outcome === 0 && round.myMoved && !round.myRevealed){
+     const saved = loadPendingReveal(round.caseId, address);
+     if(saved && saved.kind === 'simul'){
+       round.pendingReveal = { moveValue: saved.moveValue, salt: BigInt(saved.salt) };
+       round.claimSecret = BigInt(saved.secret);
+      }
+    }
+
     if(game === 'assassin'){
       round.myRole = entry.assassinIsA === iAmA ? 'assassin' : 'target';
     }
@@ -506,14 +572,28 @@ function applyRevealedMoves(round, entry){
     round.myPicks = [mv % 16, Math.floor(mv/16) % 16, Math.floor(mv/256) % 16];
     round.oppPicks = [ov % 16, Math.floor(ov/16) % 16, Math.floor(ov/256) % 16];
   } else if(round.game==='bluff'){
-    // opponent may never have actually revealed at all, if I'm the
-    // creator and I folded immediately, don't decode a value that was
-    // never really set
-    if(myRevealed && !round.myCard) round.myCard = RANKS[Math.floor(Number(myValue)/2)];
-    if(oppRevealed){
-      round.oppCard = RANKS[Math.floor(Number(oppValue)/2)];
-      const oppAction = Number(oppValue) % 2;
-      round.outcomeKind = oppAction===0 ? 'fold-opp' : null;
+    // round.myCard is drawn client-side and never comes from chain data
+    // at all. The contract doesn't expose the raw fold/bet action value
+    // directly — only whether each side has revealed an action, and
+    // separately, whether each side has revealed a card. A fold never
+    // reveals a card, so "an action was revealed, the case is already
+    // resolved, but no card followed" is how we know that reveal was a
+    // fold rather than a call.
+    const oppCardRevealed = iAmA ? entry.hasRevealedCardB : entry.hasRevealedCardA;
+    const oppCardValue = iAmA ? entry.revealedCardB : entry.revealedCardA;
+    const resolved = entry.outcome !== 0;
+
+    if(oppCardRevealed){
+      round.oppCard = RANKS[Number(oppCardValue)];
+    }
+
+    if(resolved && entry.hasRevealedA && !entry.hasRevealedB){
+      // Creator folded before the opponent ever got a chance to commit.
+      round.outcomeKind = iAmA ? null : 'creator-folded';
+    } else if(resolved && iAmA && entry.hasRevealedB && !oppCardRevealed){
+      // I'm the creator; the opponent revealed an action but no card
+      // followed it — that action was a fold.
+      round.outcomeKind = 'fold-opp';
     }
   }
 }
@@ -550,10 +630,26 @@ async function applyChainState(round, entry){
 
   const bothCommitted = entry.hasCommittedA && entry.hasCommittedB;
   if(round.game!=='bluff' && bothCommitted && round.pendingReveal && !round.myRevealed){
-    round.myRevealed = true;
     try {
       await submitRevealMove({ provider: account.provider, caseId: round.caseId, moveValue: round.pendingReveal.moveValue, salt: round.pendingReveal.salt });
-    } catch(err){ logError('auto-reveal failed', err); round.myRevealed = false; }
+      round.myRevealed = true;
+      round.revealError = null;
+      clearPendingReveal(round.caseId, account.address);
+    } catch(err){
+      logError('auto-reveal failed', err);
+      round.revealError = String(err?.message ?? err);
+    }
+    changed = true;
+  }
+    if(round.game==='bluff' && round.role==='creator' && round.stage==='pending-call' && entry.hasRevealedB && entry.outcome === 0){
+    // B has revealed something, and the case is still Unresolved — a
+    // fold would have resolved it immediately, so this means B called.
+    // Set stage before awaiting so a second poll tick mid-flight can't
+    // fire this twice.
+    round.stage = 'resolving';
+    try {
+      await submitRevealCard({ provider: account.provider, caseId: round.caseId, cardIndex: RANKS.indexOf(round.myCard), salt: round.cardSalt });
+    } catch(err){ logError('bluff auto card-reveal failed', err); round.stage = 'pending-call'; }
     changed = true;
   }
 
@@ -1043,6 +1139,7 @@ async function joinCaseById(caseIdRaw){
     const entry = await readCase(caseId);
     if(entry.opponent !== 0n) throw new Error('this case has already been joined');
     await submitJoinCase({ provider: account.provider, caseId });
+    window.history.replaceState({}, '', window.location.pathname);
     const round = newRound({ game: state.game, stake: Number(entry.stakeAmount)/1e18, role:'joiner', caseId });
     round.moveDeadline = Date.now() + MOVE_WINDOW_MS;
     if(state.game==='assassin') await startAssassinRole(round);
@@ -1213,25 +1310,38 @@ function renderMatchedPanel(el, round){
       <div class="status-row"><span class="status-dot pending"></span>Waiting on opponent</div>
       <div class="status-banner">Round resolves the moment they move, or in <span class="countdown" id="moveCountdown">${formatCountdown(round.moveDeadline-Date.now())}</span> if they don't.</div>
     `;
-    } else if(round.myMoved && round.oppMoved){
-    statusHtml = `
-      <div class="status-row"><span class="status-dot"></span>Both sides locked in</div>
-      <div class="pulse-wrap" style="padding:20px 0 6px;">
-        <div class="pulse-dot"></div>
-        <div class="waiting-msg">Finalizing on-chain \u2014 this can take a few seconds.</div>
-      </div>
-    `;
-    } else if(round.game==='bluff' && round.role==='creator'){
+  } else if(round.myMoved && round.oppMoved){
+    if(!round.pendingReveal && !round.myRevealed){
+      statusHtml = `
+        <div class="status-row"><span class="status-dot"></span>Both sides locked in</div>
+        <div class="panel-hint" style="color:var(--stamp);">This browser lost the secret needed to reveal your move (likely cleared storage). This case can't resolve normally \u2014 treat it as a loss for demo purposes and start a new case.</div>
+      `;
+    } else if(round.revealError){
+      statusHtml = `
+        <div class="status-row"><span class="status-dot"></span>Both sides locked in</div>
+        <div class="panel-hint" style="color:var(--stamp);">Reveal failed: ${round.revealError}</div>
+        <button class="btn3 wide" id="retryRevealBtn" style="margin-top:10px;">Try revealing again</button>
+      `;
+    } else {
+      statusHtml = `
+        <div class="status-row"><span class="status-dot"></span>Both sides locked in</div>
+        <div class="pulse-wrap" style="padding:20px 0 6px;">
+          <div class="pulse-dot"></div>
+          <div class="waiting-msg">Finalizing on-chain \u2014 this can take a few seconds.</div>
+        </div>
+      `;
+    }
+  } else if(round.game==='bluff' && round.role==='creator'){
     statusHtml = `
       <div class="status-row"><span class="status-dot"></span>Opponent connected</div>
       <div class="panel-hint">Bluff needs you to act first \u2014 bet or fold \u2014 before your opponent can respond. Come back anytime, they're waiting on you.</div>
     `;
-    } else {
-       statusHtml = `
-        <div class="status-row"><span class="status-dot"></span>Opponent connected</div>
-        <div class="panel-hint">You don't have to move right now \u2014 come back anytime via My Cases. But if your opponent moves first, you'll only have until <span class="countdown" id="moveCountdown">${formatCountdown(round.moveDeadline-Date.now())}</span> from now to respond before you forfeit.</div>
-      `;
-    }
+  } else {
+    statusHtml = `
+      <div class="status-row"><span class="status-dot"></span>Opponent connected</div>
+      <div class="panel-hint">You don't have to move right now \u2014 come back anytime via My Cases. But if your opponent moves first, you'll only have until <span class="countdown" id="moveCountdown">${formatCountdown(round.moveDeadline-Date.now())}</span> from now to respond before you forfeit.</div>
+    `;
+  }
 
   el.innerHTML = `
     <div class="panel torn enter">
@@ -1251,6 +1361,23 @@ function renderMatchedPanel(el, round){
     };
   }
   document.getElementById('laterBtn').onclick = ()=> goToBoard();
+
+  const retryBtn = document.getElementById('retryRevealBtn');
+  if(retryBtn){
+    retryBtn.onclick = async ()=>{
+      retryBtn.disabled = true; retryBtn.textContent = 'Retrying...';
+      try {
+        await submitRevealMove({ provider: account.provider, caseId: round.caseId, moveValue: round.pendingReveal.moveValue, salt: round.pendingReveal.salt });
+        round.myRevealed = true;
+        round.revealError = null;
+        clearPendingReveal(round.caseId, account.address);
+      } catch(err){
+        logError('manual reveal retry failed', err);
+        round.revealError = String(err?.message ?? err);
+      }
+      render();
+    };
+  }
 }
 
 function renderSimulPlay(el, round){
@@ -1283,11 +1410,15 @@ function renderSimulPlay(el, round){
   document.getElementById('lockBtn').onclick = async ()=>{
     const btn = document.getElementById('lockBtn');
     btn.textContent = 'Submitting commitment...'; btn.disabled = true;
+    const moveIndex = cfg.options.findIndex(o=>o.id===picked);
+    const salt = randomFelt();
+    const secret = randomFelt();
+    savePendingReveal(round.caseId, account.address, {
+      kind: 'simul', moveValue: moveIndex, salt: salt.toString(), secret: secret.toString(),
+    });
     try {
-      const moveIndex = cfg.options.findIndex(o=>o.id===picked);
-      const salt = randomFelt();
-      const secret = randomFelt();
-      await submitCommitMove({ provider: account.provider, caseId: round.caseId, moveValue: moveIndex, salt, claimSecret: secret });
+      const commitHash = computeMoveHash(moveIndex, salt);
+      await submitCommitMove({ provider: account.provider, caseId: round.caseId, commitHash, claimSecret: secret });
       round.myMove = picked;
       round.myMoved = true;
       round.pendingReveal = { moveValue: moveIndex, salt };
@@ -1296,7 +1427,7 @@ function renderSimulPlay(el, round){
       render();
     } catch(err) {
       logError('commit failed', err);
-      alert('could not submit your move, see console for details');
+      alert('could not submit your move \u2014 if this happens again after refreshing, it may already be on-chain; reopen this case from My Cases before retrying.');
       btn.textContent='Lock move'; btn.disabled=false;
     }
   };
@@ -1355,11 +1486,13 @@ function renderBluffPlay(el, round){
       const foldBtn = document.getElementById('foldBtn');
       foldBtn.disabled = true;
       try {
-        const moveValue = packBluffAction(0, RANKS.indexOf(round.myCard));
-        const salt = randomFelt();
+        const actionSalt = randomFelt();
+        const cardSalt = randomFelt();
+        const actionCommit = computeActionHash(0, actionSalt);
+        const cardCommit = computeCardHash(RANKS.indexOf(round.myCard), cardSalt);
         const secret = randomFelt();
-        await submitCommitMove({ provider: account.provider, caseId: round.caseId, moveValue, salt, claimSecret: secret });
-        await submitRevealMove({ provider: account.provider, caseId: round.caseId, moveValue, salt });
+        await submitCommitMove({ provider: account.provider, caseId: round.caseId, commitHash: actionCommit, cardCommit, claimSecret: secret });
+        await submitRevealAction({ provider: account.provider, caseId: round.caseId, action: 0, salt: actionSalt });
         round.claimSecret = secret;
         round.betLog.push({who:'you',action:'FOLD'});
         round.myMoved = true; round.myRevealed = true;
@@ -1375,15 +1508,27 @@ function renderBluffPlay(el, round){
       const betBtn = document.getElementById('betBtn');
       betBtn.disabled = true;
       try {
-        const moveValue = packBluffAction(1, RANKS.indexOf(round.myCard));
-        const salt = randomFelt();
+        const actionSalt = randomFelt();
+        const cardSalt = randomFelt();
+        const actionCommit = computeActionHash(1, actionSalt);
+        const cardCommit = computeCardHash(RANKS.indexOf(round.myCard), cardSalt);
         const secret = randomFelt();
-        await submitCommitMove({ provider: account.provider, caseId: round.caseId, moveValue, salt, claimSecret: secret });
-        await submitRevealMove({ provider: account.provider, caseId: round.caseId, moveValue, salt });
+        await submitCommitMove({ provider: account.provider, caseId: round.caseId, commitHash: actionCommit, cardCommit, claimSecret: secret });
+        await submitRevealAction({ provider: account.provider, caseId: round.caseId, action: 1, salt: actionSalt });
         round.claimSecret = secret;
         round.betLog.push({who:'you',action: actionLabel});
         round.myMoved = true; round.myRevealed = true;
-        round.stage = round.role==='creator' ? 'pending-call' : 'resolving';
+        if(round.role === 'creator'){
+          // I bet — my card stays sealed until the opponent calls or
+          // folds. Stash the salt so I can reveal the card later.
+          round.cardSalt = cardSalt;
+          round.stage = 'pending-call';
+        } else {
+          // I'm the opponent calling a bet I already know happened —
+          // nothing left to wait on, reveal my card right now too.
+          await submitRevealCard({ provider: account.provider, caseId: round.caseId, cardIndex: RANKS.indexOf(round.myCard), salt: cardSalt });
+          round.stage = 'resolving';
+        }
         render();
       } catch(err) {
         logError('bluff bet/call failed', err);
@@ -1483,11 +1628,15 @@ function renderAssassinPlay(el, round){
     });
     lockBtn.onclick = async ()=>{
       lockBtn.textContent = 'Submitting commitment...'; lockBtn.disabled = true;
+      const moveValue = packTiles(picks[0], picks[1], picks[2]);
+      const salt = randomFelt();
+      const secret = randomFelt();
+      savePendingReveal(round.caseId, account.address, {
+        kind: 'simul', moveValue: moveValue.toString(), salt: salt.toString(), secret: secret.toString(),
+      });
       try {
-        const moveValue = packTiles(picks[0], picks[1], picks[2]);
-        const salt = randomFelt();
-        const secret = randomFelt();
-        await submitCommitMove({ provider: account.provider, caseId: round.caseId, moveValue, salt, claimSecret: secret });
+        const commitHash = computeMoveHash(moveValue, salt);
+        await submitCommitMove({ provider: account.provider, caseId: round.caseId, commitHash, claimSecret: secret });
         round.myPicks = picks.slice();
         round.myMoved = true;
         round.pendingReveal = { moveValue, salt };
@@ -1496,7 +1645,7 @@ function renderAssassinPlay(el, round){
         render();
       } catch(err) {
         logError('assassin commit failed', err);
-        alert('could not submit your move, see console for details');
+        alert('could not submit your move \u2014 if this happens again after refreshing, it may already be on-chain; reopen this case from My Cases before retrying.');
         lockBtn.textContent='Lock selection'; lockBtn.disabled=false;
       }
     };
@@ -1509,7 +1658,9 @@ function renderAssassinResult(el, round){
   const targetPicks = round.myRole==='target' ? round.myPicks : round.oppPicks;
   const overlap = assassinPicks.filter(t=>targetPicks.includes(t));
   const outcome = round.outcome;
-  const stampText = outcome==='win' ? 'ESCAPED' : 'CAUGHT';
+  const stampText = round.myRole==='assassin'
+  ? (outcome==='win' ? 'CAUGHT' : 'ESCAPED')
+  : (outcome==='win' ? 'ESCAPED' : 'CAUGHT');
   const stampCls = outcome==='win'?'':outcome==='lose'?'lose':'tie';
 
   let markedCount=0;
@@ -1581,6 +1732,18 @@ async function checkUrlForCase(){
     const entry = await readCase(BigInt(caseIdRaw));
     const gameKey = Object.keys(GAME_TYPE_INDEX).find(k => GAME_TYPE_INDEX[k] === entry.gameType);
     if(gameKey) state.game = gameKey;
+
+    // Already matched or resolved — this link no longer means "come
+    // join an open case." Strip it so a reload/bookmark can't
+    // re-trigger the join banner; My Cases (once wallet connects)
+    // will surface it normally if it's actually this wallet's case.
+    if(entry.opponent !== 0n || entry.outcome !== 0){
+      window.history.replaceState({}, '', window.location.pathname);
+      state.view = 'board';
+      render();
+      return;
+    }
+
     state.view = 'board';
     state.pendingJoinCaseId = caseIdRaw;
     render();
