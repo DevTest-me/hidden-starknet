@@ -1,0 +1,10 @@
+[package]
+name = "hidden_case"
+version = "0.1.0"
+edition = "2024_07"
+
+[[target.starknet-contract]]
+casm = true
+
+[dependencies]
+starknet = "2.11.4"
