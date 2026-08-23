@@ -8,3 +8,9 @@ casm = true
 
 [dependencies]
 starknet = "2.11.4"
+
+[dev-dependencies]
+snforge_std = "0.63.0"
+
+[tool.scarb]
+allow-prebuilt-plugins = ["snforge_std"]
