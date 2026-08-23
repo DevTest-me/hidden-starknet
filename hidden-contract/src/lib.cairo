@@ -147,6 +147,8 @@ pub mod errors {
     pub const ACTION_ALREADY_REVEALED: felt252 = 'ACTION_ALREADY_REVEALED';
     pub const CARD_ALREADY_REVEALED: felt252 = 'CARD_ALREADY_REVEALED';
     pub const CARD_HASH_MISMATCH: felt252 = 'CARD_HASH_MISMATCH';
+    pub const WRONG_TOKEN: felt252 = 'WRONG_TOKEN';
+    pub const WRONG_AMOUNT: felt252 = 'WRONG_AMOUNT';
 }
 
 // Domain-separation tags. Each phase gets its own tag so an action-commit
@@ -297,6 +299,8 @@ pub trait IHiddenCase<T> {
         operation: CaseOperation,
         case_id: felt252,
         is_player_a: bool, // which side this call is funding/claiming for
+        token: ContractAddress, // ERC20 token; validated against entry.token on Deposit
+        amount: u128,            // amount funded; validated against entry.stake_amount on Deposit
         secret: felt252,   // claim secret; ignored on Deposit
         note_id: felt252,  // destination open note; ignored on Deposit
     ) -> Span<OpenNoteDeposit>;
@@ -795,6 +799,8 @@ pub mod HiddenCase {
             operation: CaseOperation,
             case_id: felt252,
             is_player_a: bool,
+            token: ContractAddress,
+            amount: u128,
             secret: felt252,
             note_id: felt252,
         ) -> Span<OpenNoteDeposit> {
@@ -805,6 +811,8 @@ pub mod HiddenCase {
 
             match operation {
                 CaseOperation::Deposit => {
+                    assert(token == entry.token, errors::WRONG_TOKEN);
+                    assert(amount == entry.stake_amount, errors::WRONG_AMOUNT);
                     // Funds already arrived here via the pool's Withdraw step.
                     // We just mark this side as funded. Nothing to credit yet.
                     if is_player_a {
@@ -817,13 +825,17 @@ pub mod HiddenCase {
                 },
                 CaseOperation::Claim => {
                     assert(entry.outcome != Outcome::Unresolved, errors::NOT_RESOLVED);
-                    assert(entry.funded_a && entry.funded_b, errors::NOT_FUNDED);
 
                     let claim_hash = compute_claim_hash(secret);
 
-                    // Refund path: each side can only claim their own stake back.
+                    // Refund path: each side can only claim their own stake back, and
+                    // only needs to have funded their OWN side. Requiring both sides
+                    // funded here was a bug — it made a one-sided deposit (a
+                    // cancelled or expired never-joined case) permanently stuck,
+                    // since the other side was never going to fund it by definition.
                     if entry.outcome == Outcome::Refund {
                         if is_player_a {
+                            assert(entry.funded_a, errors::NOT_FUNDED);
                             assert(!entry.claimed_a, errors::ALREADY_CLAIMED);
                             assert(claim_hash == entry.claim_hash_a, errors::CLAIM_HASH_MISMATCH);
                             entry.claimed_a = true;
@@ -842,6 +854,7 @@ pub mod HiddenCase {
                             ]
                                 .span();
                         } else {
+                            assert(entry.funded_b, errors::NOT_FUNDED);
                             assert(!entry.claimed_b, errors::ALREADY_CLAIMED);
                             assert(claim_hash == entry.claim_hash_b, errors::CLAIM_HASH_MISMATCH);
                             entry.claimed_b = true;
@@ -861,6 +874,11 @@ pub mod HiddenCase {
                                 .span();
                         }
                     }
+
+                    // Winner-take-all path genuinely needs both sides funded —
+                    // the pot being paid out is stake_amount * 2, so both
+                    // stakes actually need to be sitting in the contract.
+                    assert(entry.funded_a && entry.funded_b, errors::NOT_FUNDED);
 
                     // Winner-take-all path: only the winning side's claim_hash
                     // unlocks the full (fee-adjusted) pot.
