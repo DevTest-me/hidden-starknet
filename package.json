@@ -17,5 +17,10 @@
     "@starknet-io/get-starknet-wallet-standard": "^5.0.0-beta.0",
     "starknet": "^10.7.0",
     "starknet-sessions": "^0.0.2"
+  },
+  "overrides": {
+    "@argent/x-sessions": {
+      "starknet": "$starknet"
+    }
   }
 }
