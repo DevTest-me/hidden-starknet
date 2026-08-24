@@ -12,8 +12,9 @@
     "vite": "^8.2.0"
   },
   "dependencies": {
-    "@argent/x-sessions": "^8.0.1",
-    "get-starknet": "^4.0.0",
+    "@argent/x-sessions": "^10.0.0",
+    "@starknet-io/get-starknet": "^4.0.8",
+    "@starknet-io/get-starknet-wallet-standard": "^5.0.0-beta.0",
     "starknet": "^10.7.0",
     "starknet-sessions": "^0.0.2"
   }
