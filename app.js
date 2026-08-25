@@ -16,7 +16,7 @@ import { requestSessionAccount } from "starknet-sessions";
 // DEBUG=true logs every chain interaction to the console with a
 // [HIDDEN] prefix, open devtools before testing anything. Flip to
 // false once things are working reliably and the noise isn't needed.
-const DEBUG = true;
+const DEBUG = false;
 function log(...args){ if(DEBUG) console.log('[HIDDEN]', ...args); }
 function logError(...args){ if(DEBUG) console.error('[HIDDEN]', ...args); }
 function toFelt(value){
@@ -101,6 +101,12 @@ const JOIN_PRESETS = [
   {label:'24 hours', ms:24*60*60*1000},
 ];
 const MOVE_WINDOW_MS = 4*60*60*1000;
+// Shielded balance reads apparently require wallet authorization per
+// query (not a plain public balance read), so polling this often in
+// the background means a wallet popup firing every few seconds during
+// an active match. Keep background auto-refresh rare — the manual
+// refresh button in the profile drawer covers anyone who wants it sooner.
+const SHIELDED_BALANCE_AUTO_REFRESH_MS = 30 * 60 * 1000; // 30 minutes
 const CONTRACT_ADDRESS = '0x06ed9634d896c832c6cfe1570f772ab8e24ecc2d693b3aa801cadfd16742a599';
 const STRK_ADDRESS = '0x04718f5a0fc34cc1af16a1cdee98ffb20c31f5cd61d6ab07201858f4287c938d';
 const MAINNET_RPC_URL = `https://starknet-mainnet.g.alchemy.com/starknet/version/rpc/v0_8/${import.meta.env.VITE_ALCHEMY_KEY}`;
@@ -660,7 +666,7 @@ async function rehydrateMyRounds(address){
 function startCasePolling(round){
   round.pollTimer = setInterval(async ()=>{
     if(round.stage==='expired' || round.stage==='result'){ clearInterval(round.pollTimer); return; }
-    if(Date.now() - lastShieldedBalanceRefreshAt >= 15000){
+    if(Date.now() - lastShieldedBalanceRefreshAt >= SHIELDED_BALANCE_AUTO_REFRESH_MS){
       lastShieldedBalanceRefreshAt = Date.now();
       refreshShieldedBalance();
     }
@@ -1109,7 +1115,11 @@ function renderSideProfile(){
     <div class="profile-card torn" id="sideProfileCard">
       <div class="p-name">${PROFILE.username}</div>
       <div class="p-title">${profileTitle()}</div>
-      <div class="p-balance">${PROFILE.balance.toFixed(2)}<span class="p-balance-unit">STRK</span></div>
+      <div style="display:flex;align-items:center;gap:8px;">
+        <div class="p-balance">${PROFILE.balance.toFixed(2)}<span class="p-balance-unit">STRK</span></div>
+        <button id="sideRefreshBalanceBtn" type="button" aria-label="Refresh balance" title="Refresh balance"
+          style="width:22px;height:22px;min-width:22px;padding:0;display:inline-flex;align-items:center;justify-content:center;font-size:13px;line-height:1;border-radius:50%;border:1px solid currentColor;background:transparent;color:inherit;cursor:pointer;flex-shrink:0;">↻</button>
+      </div>
       ${PROFILE.balance === 0 ? '<div class="panel-hint">No shielded STRK yet — shield STRK in your wallet first.</div>' : ''}
       <div class="p-stats">
         <div><div class="p-stat-val">${PROFILE.gamesPlayed}</div><div class="p-stat-lbl">Played</div></div>
@@ -1123,6 +1133,14 @@ function renderSideProfile(){
     </div>
   `;
   document.getElementById('viewProfileBtn').onclick = openProfile;
+    document.getElementById('sideRefreshBalanceBtn').onclick = async (e)=>{
+    e.stopPropagation();
+    const btn = e.currentTarget;
+    btn.disabled = true;
+    btn.textContent = '…';
+    try { await refreshShieldedBalance(); }
+    finally { renderSideProfile(); }
+  };
 }
 
 function openProfile(){
@@ -1150,7 +1168,11 @@ function openProfile(){
       <button class="close-x" id="closeProfileBtn">CLOSE &times;</button>
       <div class="p-name" style="font-size:24px;">${PROFILE.username}</div>
       <div class="p-title">${profileTitle()}</div>
-      <div class="p-balance" style="font-size:38px;">${PROFILE.balance.toFixed(2)}<span class="p-balance-unit">STRK shielded balance</span></div>
+      <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;">
+        <div class="p-balance" style="font-size:38px;">${PROFILE.balance.toFixed(2)}<span class="p-balance-unit">STRK shielded balance</span></div>
+        <button id="fullRefreshBalanceBtn" type="button" aria-label="Refresh balance" title="Refresh balance"
+          style="width:28px;height:28px;min-width:28px;padding:0;display:inline-flex;align-items:center;justify-content:center;font-size:15px;line-height:1;border-radius:50%;border:1px solid currentColor;background:transparent;color:inherit;cursor:pointer;flex-shrink:0;">↻</button>
+      </div>
       ${PROFILE.balance === 0 ? '<div class="panel-hint">No shielded STRK yet — shield STRK in your wallet first.</div>' : ''}
       <div class="p-stats-full">
         <div><div class="stat-val">${PROFILE.gamesPlayed}</div><div class="stat-lbl">Games played</div></div>
@@ -1169,6 +1191,13 @@ function openProfile(){
     </div>
   `;
   document.getElementById('closeProfileBtn').onclick = closeProfile;
+  document.getElementById('fullRefreshBalanceBtn').onclick = async (e)=>{
+    const btn = e.currentTarget;
+    btn.disabled = true;
+    btn.textContent = '…';
+    try { await refreshShieldedBalance(); }
+    finally { openProfile(); }
+  };
   document.getElementById('shareProfileBtn').onclick = async (e)=>{
     if(navigator.share){ try{ await navigator.share({ text: shareText, title:'HIDDEN' }); return; }catch(err){} }
     navigator.clipboard?.writeText(shareText).catch(()=>{});
