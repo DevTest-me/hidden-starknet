@@ -165,7 +165,7 @@ Then run whichever dev script your `package.json` defines (typically `npm run de
 **Before submission:**
 
 - [ ] Record demo video
-- [ ] Turn off default debug logging
+- [x] Turn off default debug logging
 
 **After the hackathon:**
 
