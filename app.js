@@ -759,7 +759,8 @@ async function applyChainState(round, entry){
   if(oppRevealedNow && !round.oppRevealed){ round.oppRevealed = true; changed = true; }
 
   const bothCommitted = entry.hasCommittedA && entry.hasCommittedB;
-  if(round.game!=='bluff' && bothCommitted && round.pendingReveal && !round.myRevealed){
+  if(round.game!=='bluff' && bothCommitted && round.pendingReveal && !round.myRevealed && !round.revealAutoPending){
+    round.revealAutoPending = true;
     try {
       await submitRevealMove({ provider: account.provider, caseId: round.caseId, moveValue: round.pendingReveal.moveValue, salt: round.pendingReveal.salt });
       round.myRevealed = true;
@@ -768,6 +769,7 @@ async function applyChainState(round, entry){
     } catch(err){
       logError('auto-reveal failed', err);
       round.revealError = String(err?.message ?? err);
+      round.revealAutoPending = false; // let it retry on next poll if it genuinely failed
     }
     changed = true;
   }
@@ -1009,14 +1011,7 @@ async function connectAccount(){
     } catch (balanceErr) {
       logError('could not read shielded STRK balance', balanceErr);
     }
-    let sessionAccount = null;
-    try {
-      sessionAccount = await createSessionAccount(wallets[0].id, provider, address);
-      if(sessionAccount) log('connectAccount: session account ready', wallets[0].name);
-    } catch(err) {
-      logError('connectAccount: session setup failed, continuing without session key', err);
-      if(account) account.sessionAccount = null;
-    }
+    let sessionAccount = null; // sessions disabled — was interfering with mobile wallet connections
     try { await rehydrateMyRounds(address); }
     catch(err) { logError('connectAccount: failed to rehydrate My Cases', err); }
     log('connectAccount: connected', { address, shieldedBalance, sessionAccount:!!sessionAccount });
