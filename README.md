@@ -73,7 +73,7 @@ Everything below runs against a deployed contract and the live STRK20 pool — n
 
 **Not working yet:**
 
-- **Session keys.** Gasless-feeling commit/reveal via Argent X and Braavos session accounts is implemented but doesn't function correctly yet. The session packages for both wallets (`@argent/x-sessions`, `starknet-sessions`) build their session account against an older `starknet.js` account-construction shape than the version this project is on, so the two don't line up. Every commit/reveal currently falls back to a normal wallet popup and signature instead of running through a session key — functionally fine, just an extra signature per action instead of a smoother flow.
+- **Session keys.** Not currently implemented. An earlier attempt at gasless-feeling commit/reveal via Argent X and Braavos session accounts was removed — the session packages for both wallets (`@argent/x-sessions`, `starknet-sessions`) build their session account against an older `starknet.js` account-construction shape than the version this project is on, and reconciling the two wasn't worth the remaining time. Every commit/reveal goes through a normal wallet popup and signature.
 
 <br/>
 
@@ -101,9 +101,9 @@ If `Deposit` ever fires twice for the same side (a bug upstream in the pool, a r
 
 **Fix, not yet shipped:** a one-line `assert(!entry.funded_a, errors::ALREADY_FUNDED)` (and the `_b` equivalent), same pattern already used for `claimed_a` / `claimed_b` a few lines down. Small change, but it touches the live contract, so it's queued for the next deployment rather than rushed in.
 
-### 2. Session keys don't work yet
+### 2. No session-key support
 
-Covered above — falls back to a normal signature per action. No funds-safety impact, just a UX rough edge.
+Covered above — every action is a normal signed wallet popup, no batching or gasless flow. No funds-safety impact, just a UX rough edge; bundling (see the "Confirmed working" list) already cuts down the popup count where it safely can.
 
 ### 3. Assassin's role assignment is timestamp-derived, not committed
 
@@ -151,7 +151,7 @@ Then run whichever dev script your `package.json` defines (typically `npm run de
 .
 ├── index.html          # shell + game tabs
 ├── style.css            # visual design
-├── app.js                # game engines, chain wiring, session-key setup, render loop
+├── app.js                # game engines, chain wiring, render loop
 ├── contracts/
 │   └── hidden_case.cairo # the deployed HiddenCase contract (Cairo)
 ├── icon.svg / icon.jpg
@@ -170,7 +170,7 @@ Then run whichever dev script your `package.json` defines (typically `npm run de
 **After the hackathon:**
 
 - [ ] Ship the `ALREADY_FUNDED` guard on `Deposit` (see Known limitations #1)
-- [ ] Fix session-key account construction so Argent X / Braavos sessions actually work
+- [ ] Add session-key support (Argent X / Braavos) once the packages catch up to this project's `starknet.js` version, or an account-construction bridge is written
 - [ ] Move Assassin's role assignment to a dedicated commit-reveal round
 - [ ] Replace the linear case-ID probe with event-indexed lookups if volume grows
 
