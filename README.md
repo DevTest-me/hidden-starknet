@@ -62,7 +62,7 @@ Everything below runs against a deployed contract and the live STRK20 pool — n
 
 **Confirmed working, end to end:**
 
-- Wallet connect for Ready X (Argent X), Braavos, and Xverse, via each wallet's injected `wallet-standard` provider
+- Wallet connect for Ready X, Braavos, and Xverse, via each wallet's injected `wallet-standard` provider
 - The full case lifecycle for all four games — `create_case` → `join_case` → `commit_move` → `reveal_move` / `reveal_action` / `reveal_card` → `resolve` — against the deployed `HiddenCase` contract
 - Real stake transfers through the STRK20 pool's `privacy_invoke` (Deposit on create/join, Claim on payout or refund), sent via `WalletAccountV6.strk20InvokeTransaction`
 - Shielded STRK balance reads, refreshed periodically and after every claim
@@ -121,17 +121,17 @@ The 2% platform fee, the STRK20 pool address, and the platform fee wallet are al
 
 Games played, win rate, streaks, and total staked/won are stored in `localStorage`, not on any shared leaderboard. Your on-chain shielded balance is always read live from your wallet; everything else in the profile card is just this browser's memory of your play.
 
-### 7. Debug logging is on by default
+### 7. Debug logging
 
-`DEBUG = true` at the top of `app.js` logs every chain interaction to the console with a `[HIDDEN] ` prefix. Left on for now while activity is still being watched closely right after launch; worth flipping to `false` once things have settled.
+`DEBUG` at the top of `app.js` gates every `[HIDDEN] `-prefixed console log of chain interactions. Currently set to `false` for the mainnet build. Flip it to `true` locally if you need the verbose trace while debugging.
 
 <br/>
 
 ## Running it locally
 
 ```bash
-git clone https://github.com/<your-username>/hidden.git
-cd hidden
+git clone https://github.com/DevTest-me/hidden-starknet.git
+cd hidden-starknet
 npm install
 ```
 
