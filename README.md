@@ -73,7 +73,7 @@ Everything below runs against a deployed contract and the live STRK20 pool — n
 
 **Not working yet:**
 
-- **Session keys.** Not currently implemented. An earlier attempt at gasless-feeling commit/reveal via Argent X and Braavos session accounts was removed — the session packages for both wallets (`@argent/x-sessions`, `starknet-sessions`) build their session account against an older `starknet.js` account-construction shape than the version this project is on, and reconciling the two wasn't worth the remaining time. Every commit/reveal goes through a normal wallet popup and signature.
+- **Session keys.** Not currently implemented. An earlier attempt at gasless-feeling commit/reveal via Ready X and Braavos session accounts was removed — the session packages for both wallets (`@argent/x-sessions`, `starknet-sessions`) build their session account against an older `starknet.js` account-construction shape than the version this project is on, and reconciling the two wasn't worth the remaining time. Every commit/reveal goes through a normal wallet popup and signature.
 
 <br/>
 
